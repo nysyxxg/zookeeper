@@ -29,7 +29,7 @@ import org.openjdk.jmh.annotations.*;
 import java.util.concurrent.TimeUnit;
 
 @Fork(3)
-public class WatchBench {
+public class WatchBench {    
 
     static final String pathPrefix = "/reasonably/long/path/";
     static final EventType event = EventType.NodeDataChanged;
