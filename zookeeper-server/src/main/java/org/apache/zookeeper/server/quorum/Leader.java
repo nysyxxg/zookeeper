@@ -19,6 +19,10 @@
 package org.apache.zookeeper.server.quorum;
 
 import java.io.BufferedInputStream;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.io.IOException;
 import java.net.BindException;
 import java.net.ServerSocket;
@@ -41,16 +45,20 @@ import java.util.concurrent.ConcurrentMap;
 
 import javax.security.sasl.SaslException;
 
+import org.apache.zookeeper.KeeperException;
 import org.apache.zookeeper.ZooDefs.OpCode;
-import org.apache.zookeeper.common.QuorumX509Util;
 import org.apache.zookeeper.common.Time;
 import org.apache.zookeeper.common.X509Exception;
+import org.apache.zookeeper.jmx.MBeanRegistry;
 import org.apache.zookeeper.server.FinalRequestProcessor;
 import org.apache.zookeeper.server.Request;
 import org.apache.zookeeper.server.RequestProcessor;
 import org.apache.zookeeper.server.ServerMetrics;
 import org.apache.zookeeper.server.ZooKeeperCriticalThread;
 import org.apache.zookeeper.server.quorum.QuorumPeer.LearnerType;
+import org.apache.zookeeper.server.ZKDatabase;
+import org.apache.zookeeper.server.ZooTrace;
+import org.apache.zookeeper.server.quorum.auth.QuorumAuthServer;
 import org.apache.zookeeper.server.quorum.flexible.QuorumVerifier;
 import org.apache.zookeeper.server.util.SerializeUtils;
 import org.apache.zookeeper.server.util.ZxidUtils;
@@ -61,7 +69,7 @@ import org.slf4j.LoggerFactory;
 /**
  * This class has the control logic for the Leader.
  */
-public class Leader {
+public class Leader implements LearnerMaster {
     private static final Logger LOG = LoggerFactory.getLogger(Leader.class);
 
     static final private boolean nodelay = System.getProperty("leader.nodelay", "true").equals("true");
@@ -93,6 +101,22 @@ public class Leader {
 
     private final LearnerSnapshotThrottler learnerSnapshotThrottler;
 
+    // log ack latency if zxid is a multiple of ackLoggingFrequency. If <=0, disable logging.
+    protected static final String ACK_LOGGING_FREQUENCY = "zookeeper.leader.ackLoggingFrequency";
+    private static int ackLoggingFrequency;
+    static {
+        ackLoggingFrequency = Integer.getInteger(ACK_LOGGING_FREQUENCY, 1000);
+        LOG.info(ACK_LOGGING_FREQUENCY + " = " + ackLoggingFrequency);
+    }
+
+    public static void setAckLoggingFrequency(int frequency) {
+        ackLoggingFrequency = frequency;
+    }
+
+    public static int getAckLoggingFrequency() {
+        return ackLoggingFrequency;
+    }
+
     final LeaderZooKeeperServer zk;
 
     final QuorumPeer self;
@@ -119,6 +143,9 @@ public class Leader {
                 maxConcurrentSnapshots, maxConcurrentSnapshotTimeout);
     }
 
+    // beans for all learners
+    private final ConcurrentHashMap<LearnerHandler, LearnerHandlerBean> connectionBeans = new ConcurrentHashMap<>();
+
     /**
      * Returns a copy of the current learner snapshot
      */
@@ -141,7 +168,19 @@ public class Leader {
         }
     }
 
-    private void addForwardingFollower(LearnerHandler lh) {
+    public List<LearnerHandler> getNonVotingFollowers() {
+        List<LearnerHandler> nonVotingFollowers = new ArrayList<LearnerHandler>();
+        synchronized (forwardingFollowers) {
+            for (LearnerHandler lh : forwardingFollowers) {
+                if (!isParticipant(lh.getSid())) {
+                    nonVotingFollowers.add(lh);
+                }
+            }
+        }
+        return nonVotingFollowers;
+    }
+
+    void addForwardingFollower(LearnerHandler lh) {
         synchronized (forwardingFollowers) {
             forwardingFollowers.add(lh);
         }
@@ -165,6 +204,24 @@ public class Leader {
         }
     }
 
+    public Iterable<Map<String, Object>> getObservingLearnersInfo() {
+        Set<Map<String,Object>> info = new HashSet<>();
+        synchronized (observingLearners) {
+            for (LearnerHandler lh: observingLearners) {
+                info.add(lh.getLearnerHandlerInfo());
+            }
+        }
+        return info;
+    }
+
+    public void resetObserverConnectionStats() {
+        synchronized (observingLearners) {
+            for (LearnerHandler lh : observingLearners) {
+                lh.resetObserverConnectionStats();
+            }
+        }
+    }
+
     // Pending sync requests. Must access under 'this' lock.
     private final Map<Long,List<LearnerSyncRequest>> pendingSyncs =
         new HashMap<Long,List<LearnerSyncRequest>>();
@@ -182,7 +239,8 @@ public class Leader {
      * @param learner
      *                instance of learner handle
      */
-    void addLearnerHandler(LearnerHandler learner) {
+    @Override
+    public void addLearnerHandler(LearnerHandler learner) {
         synchronized (learners) {
             learners.add(learner);
         }
@@ -193,7 +251,8 @@ public class Leader {
      *
      * @param peer
      */
-    void removeLearnerHandler(LearnerHandler peer) {
+    @Override
+    public void removeLearnerHandler(LearnerHandler peer) {
         synchronized (forwardingFollowers) {
             forwardingFollowers.remove(peer);
         }
@@ -234,21 +293,16 @@ public class Leader {
 
     private final ServerSocket ss;
 
-    Leader(QuorumPeer self,LeaderZooKeeperServer zk) throws IOException, X509Exception {
+    Leader(QuorumPeer self,LeaderZooKeeperServer zk) throws IOException {
         this.self = self;
         this.proposalStats = new BufferStats();
         try {
-            if (self.shouldUsePortUnification()) {
+            if (self.shouldUsePortUnification() || self.isSslQuorum()) {
+                boolean allowInsecureConnection = self.shouldUsePortUnification();
                 if (self.getQuorumListenOnAllIPs()) {
-                    ss = new UnifiedServerSocket(new QuorumX509Util(), self.getQuorumAddress().getPort());
+                    ss = new UnifiedServerSocket(self.getX509Util(), allowInsecureConnection, self.getQuorumAddress().getPort());
                 } else {
-                    ss = new UnifiedServerSocket(new QuorumX509Util());
-                }
-            } else if (self.isSslQuorum()) {
-                if (self.getQuorumListenOnAllIPs()) {
-                    ss = new QuorumX509Util().createSSLServerSocket(self.getQuorumAddress().getPort());
-                } else {
-                    ss = new QuorumX509Util().createSSLServerSocket();
+                    ss = new UnifiedServerSocket(self.getX509Util(), allowInsecureConnection);
                 }
             } else {
                 if (self.getQuorumListenOnAllIPs()) {
@@ -261,9 +315,6 @@ public class Leader {
             if (!self.getQuorumListenOnAllIPs()) {
                 ss.bind(self.getQuorumAddress());
             }
-        } catch (X509Exception e) {
-            LOG.error("Failed to setup ssl server socket", e);
-            throw e;
         } catch (BindException e) {
             if (self.getQuorumListenOnAllIPs()) {
                 LOG.error("Couldn't bind to port " + self.getQuorumAddress().getPort(), e);
@@ -399,8 +450,10 @@ public class Leader {
         public void run() {
             try {
                 while (!stop) {
-                    try{
-                        Socket s = ss.accept();
+                    Socket s = null;
+                    boolean error = false;
+                    try {
+                        s = ss.accept();
 
                         // start with the initLimit, once the ack is processed
                         // in LearnerHandler switch to the syncLimit
@@ -409,9 +462,11 @@ public class Leader {
 
                         BufferedInputStream is = new BufferedInputStream(
                                 s.getInputStream());
-                        LearnerHandler fh = new LearnerHandler(s, is, Leader.this);
+                        LearnerHandler fh = new LearnerHandler(s, is,
+                                Leader.this);
                         fh.start();
                     } catch (SocketException e) {
+                        error = true;
                         if (stop) {
                             LOG.info("exception while shutting down acceptor: "
                                     + e);
@@ -425,6 +480,19 @@ public class Leader {
                         }
                     } catch (SaslException e){
                         LOG.error("Exception while connecting to quorum learner", e);
+                        error = true;
+                    } catch (Exception e) {
+                        error = true;
+                        throw e;
+                    } finally {
+                        // Don't leak sockets on errors
+                        if (error && s != null && !s.isClosed()) {
+                            try {
+                                s.close();
+                            } catch (IOException e) {
+                                LOG.warn("Error closing socket", e);
+                            }
+                        }
                     }
                 }
             } catch (Exception e) {
@@ -469,7 +537,7 @@ public class Leader {
         self.end_fle = Time.currentElapsedTime();
         long electionTimeTaken = self.end_fle - self.start_fle;
         self.setElectionTimeTaken(electionTimeTaken);
-        ServerMetrics.ELECTION_TIME.add(electionTimeTaken);
+        ServerMetrics.getMetrics().ELECTION_TIME.add(electionTimeTaken);
         LOG.info("LEADING - LEADER ELECTION TOOK - {} {}", electionTimeTaken,
                 QuorumPeer.FLE_TIME_UNIT);
         self.start_fle = 0;
@@ -547,6 +615,7 @@ public class Leader {
 
              waitForEpochAck(self.getId(), leaderStateSummary);
              self.setCurrentEpoch(epoch);
+            self.setLeaderAddressAndId(self.getQuorumAddress(), self.getId());
 
              try {
                  waitForNewLeaderAck(self.getId(), zk.getZxid());
@@ -830,6 +899,7 @@ public class Leader {
             informAndActivate(p, designatedLeader);
             //turnOffFollowers();
         } else {
+            p.request.logLatency(ServerMetrics.getMetrics().QUORUM_ACK_LATENCY);
             commit(zxid);
             inform(p);
         }
@@ -851,6 +921,7 @@ public class Leader {
      * @param sid, the id of the server that sent the ack
      * @param followerAddr
      */
+    @Override
     synchronized public void processAck(long sid, long zxid, SocketAddress followerAddr) {
         if (!allowedToCommit) return; // last op committed was a leader change - from now on
                                      // the new leader should commit
@@ -893,6 +964,10 @@ public class Leader {
             LOG.warn("Trying to commit future proposal: zxid 0x{} from {}",
                     Long.toHexString(zxid), followerAddr);
             return;
+        }
+
+        if (ackLoggingFrequency > 0 && (zxid % ackLoggingFrequency == 0)) {
+            p.request.logLatency(ServerMetrics.getMetrics().ACK_LATENCY, Long.toString(sid));
         }
 
         p.addAck(sid);
@@ -1023,7 +1098,7 @@ public class Leader {
         }
         QuorumPacket qp = new QuorumPacket(Leader.COMMIT, zxid, null, null);
         sendPacket(qp);
-        ServerMetrics.COMMIT_COUNT.add(1);
+        ServerMetrics.getMetrics().COMMIT_COUNT.add(1);
     }
 
     //commit and send some info
@@ -1049,23 +1124,30 @@ public class Leader {
         sendObserverPacket(qp);
     }
 
-
-    /**
-     * Create an inform&activate packet and send it to all observers.
-     */
-    public void informAndActivate(Proposal proposal, long designatedLeader) {
-       byte[] proposalData = proposal.packet.getData();
+    public static QuorumPacket buildInformAndActivePacket(long zxid,
+            long designatedLeader, byte[] proposalData) {
         byte[] data = new byte[proposalData.length + 8];
         ByteBuffer buffer = ByteBuffer.wrap(data);
-       buffer.putLong(designatedLeader);
-       buffer.put(proposalData);
+        buffer.putLong(designatedLeader);
+        buffer.put(proposalData);
 
-        QuorumPacket qp = new QuorumPacket(Leader.INFORMANDACTIVATE, proposal.request.zxid, data, null);
-        sendObserverPacket(qp);
+        return new QuorumPacket(Leader.INFORMANDACTIVATE, zxid, data, null);
+    }
+
+    /**
+     * Create an inform and activate packet and send it to all observers.
+     */
+    public void informAndActivate(Proposal proposal, long designatedLeader) {
+        sendObserverPacket(buildInformAndActivePacket(proposal.request.zxid,
+                designatedLeader, proposal.packet.getData()));
     }
 
     long lastProposed;
 
+    @Override
+    synchronized public long getLastProposed() {
+        return lastProposed;
+    }
 
     /**
      * Returns the current epoch of the leader.
@@ -1128,9 +1210,11 @@ public class Leader {
             outstandingProposals.put(lastProposed, p);
             sendPacket(pp);
         }
+        ServerMetrics.getMetrics().PROPOSAL_COUNT.add(1);
         return p;
     }
 
+    @Override
     public LearnerSnapshotThrottler getLearnerSnapshotThrottler() {
         return learnerSnapshotThrottler;
     }
@@ -1168,8 +1252,8 @@ public class Leader {
      *
      * @param handler handler of the follower
      * @return last proposed zxid
-     * @throws InterruptedException
      */
+    @Override
     synchronized public long startForwarding(LearnerHandler handler,
             long lastSeenZxid) {
         // Queue up any outstanding requests enabling the receipt of
@@ -1206,6 +1290,16 @@ public class Leader {
 
         return lastProposed;
     }
+
+    @Override
+    public void waitForStartup() throws InterruptedException {
+        synchronized(zk) {
+            while(!zk.isRunning() && !Thread.currentThread().isInterrupted()) {
+                zk.wait(20);
+            }
+        }
+    }
+
     // VisibleForTesting
     protected final Set<Long> connectingFollowers = new HashSet<Long>();
 
@@ -1229,7 +1323,7 @@ public class Leader {
     /**
      * Quit condition:
      *
-     * 1 voter goes to looking again and time waitForEpoch > maxTimeToWaitForEpoch
+     * 1 voter goes to looking again and time waitForEpoch &gt; maxTimeToWaitForEpoch
      *
      * Note: the voter may go to looking again in case of:
      * 1. change mind in the last minute when received a different notification
@@ -1242,6 +1336,7 @@ public class Leader {
             quitWaitForEpoch = true;
             connectingFollowers.notifyAll();
         }
+        ServerMetrics.getMetrics().QUIT_LEADING_DUE_TO_DISLOYAL_VOTER.add(1);
         LOG.info("Quit leading due to voter changed mind.");
     }
 
@@ -1262,6 +1357,7 @@ public class Leader {
         }
     }
 
+    @Override
     public long getEpochToPropose(long sid, long lastAcceptedEpoch) throws InterruptedException, IOException {
         synchronized(connectingFollowers) {
             if (!waitingForNewEpoch) {
@@ -1298,10 +1394,17 @@ public class Leader {
         }
     }
 
+    @Override
+    public ZKDatabase getZKDatabase() {
+        return zk.getZKDatabase();
+    }
+
     // VisibleForTesting
     protected final Set<Long> electingFollowers = new HashSet<Long>();
     // VisibleForTesting
     protected boolean electionFinished = false;
+
+    @Override
     public void waitForEpochAck(long id, StateSummary ss) throws IOException, InterruptedException {
         synchronized(electingFollowers) {
             if (electionFinished) {
@@ -1402,6 +1505,7 @@ public class Leader {
      * @param sid
      * @throws InterruptedException
      */
+    @Override
     public void waitForNewLeaderAck(long sid, long zxid)
             throws InterruptedException {
 
@@ -1501,5 +1605,106 @@ public class Leader {
 
     private boolean isParticipant(long sid) {
         return self.getQuorumVerifier().getVotingMembers().containsKey(sid);
+    }
+
+    @Override
+    public int getCurrentTick() {
+        return self.tick.get();
+    }
+
+    @Override
+    public int syncTimeout() {
+        return self.tickTime * self.syncLimit;
+    }
+
+    @Override
+    public int getTickOfNextAckDeadline() {
+        return self.tick.get() + self.syncLimit;
+    }
+
+    @Override
+    public int getTickOfInitialAckDeadline() {
+        return self.tick.get() + self.initLimit + self.syncLimit;
+    }
+
+    @Override
+    public long getAndDecrementFollowerCounter() {
+        return followerCounter.getAndDecrement();
+    }
+
+    @Override
+    public void touch(long sess, int to) {
+        zk.touch(sess, to);
+    }
+
+    @Override
+    public void submitLearnerRequest(Request si) {
+        zk.submitLearnerRequest(si);
+    }
+
+    @Override
+    public long getQuorumVerifierVersion() {
+        return self.getQuorumVerifier().getVersion();
+    }
+
+    @Override
+    public String getPeerInfo(long sid) {
+        QuorumPeer.QuorumServer server = self.getView().get(sid);
+        return server == null ? "" : server.toString();
+    }
+
+    @Override
+    public byte[] getQuorumVerifierBytes() {
+        return self.getLastSeenQuorumVerifier().toString().getBytes();
+    }
+
+    @Override
+    public QuorumAuthServer getQuorumAuthServer() {
+        return (self == null) ? null : self.authServer;
+    }
+
+    @Override
+    public void revalidateSession(QuorumPacket qp, LearnerHandler learnerHandler) throws IOException {
+        ByteArrayInputStream bis = new ByteArrayInputStream(qp.getData());
+        DataInputStream dis = new DataInputStream(bis);
+        long id = dis.readLong();
+        int to = dis.readInt();
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        DataOutputStream dos = new DataOutputStream(bos);
+        dos.writeLong(id);
+        boolean valid = zk.checkIfValidGlobalSession(id, to);
+        if (valid) {
+            try {
+                // set the session owner as the follower that owns the session
+                zk.setOwner(id, learnerHandler);
+            } catch (KeeperException.SessionExpiredException e) {
+                LOG.error("Somehow session " + Long.toHexString(id) + " expired right after being renewed! (impossible)", e);
+            }
+        }
+        if (LOG.isTraceEnabled()) {
+            ZooTrace.logTraceMessage(LOG,
+                    ZooTrace.SESSION_TRACE_MASK,
+                    "Session 0x" + Long.toHexString(id)
+                            + " is valid: "+ valid);
+        }
+        dos.writeBoolean(valid);
+        qp.setData(bos.toByteArray());
+        learnerHandler.queuePacket(qp);
+    }
+
+    @Override
+    public void registerLearnerHandlerBean(final LearnerHandler learnerHandler, Socket socket) {
+        LearnerHandlerBean bean = new LearnerHandlerBean(learnerHandler, socket);
+        if (zk.registerJMX(bean)) {
+            connectionBeans.put(learnerHandler, bean);
+        }
+    }
+
+    @Override
+    public void unregisterLearnerHandlerBean(final LearnerHandler learnerHandler) {
+        LearnerHandlerBean bean = connectionBeans.remove(learnerHandler);
+        if (bean != null){
+            MBeanRegistry.getInstance().unregister(bean);
+        }
     }
 }

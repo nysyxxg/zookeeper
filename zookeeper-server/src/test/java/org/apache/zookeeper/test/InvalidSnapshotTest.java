@@ -25,7 +25,6 @@ import java.io.File;
 import org.apache.zookeeper.PortAssignment;
 import org.apache.zookeeper.ZKTestCase;
 import org.apache.zookeeper.ZooKeeper;
-import org.apache.zookeeper.server.LogFormatter;
 import org.apache.zookeeper.server.ServerCnxnFactory;
 import org.apache.zookeeper.server.SnapshotFormatter;
 import org.apache.zookeeper.server.SyncRequestProcessor;
@@ -41,17 +40,18 @@ public class InvalidSnapshotTest extends ZKTestCase{
             "127.0.0.1:" + PortAssignment.unique();
 
     private static final File testData = new File(
-            System.getProperty("test.data.dir", "build/test/data"));
+            System.getProperty("test.data.dir", "src/test/resources/data"));
 
     /**
      * Verify the LogFormatter by running it on a known file.
      */
+    @SuppressWarnings("deprecation")
     @Test
     public void testLogFormatter() throws Exception {
         File snapDir = new File(testData, "invalidsnap");
         File logfile = new File(new File(snapDir, "version-2"), "log.274");
         String[] args = {logfile.getCanonicalFile().toString()};
-        LogFormatter.main(args);
+        org.apache.zookeeper.server.LogFormatter.main(args);
     }
 
     /**

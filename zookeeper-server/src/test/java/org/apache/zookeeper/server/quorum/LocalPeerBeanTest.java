@@ -22,7 +22,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
-import static org.mockito.Matchers.eq;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -55,7 +55,7 @@ public class LocalPeerBeanTest {
         ServerCnxnFactory cnxnFactory = ServerCnxnFactory.createFactory();
         int clientPort = PortAssignment.unique();
         InetSocketAddress address = new InetSocketAddress(clientPort);
-        cnxnFactory.configure(address, 5, false);
+        cnxnFactory.configure(address, 5, -1, false);
         quorumPeer.setCnxnFactory(cnxnFactory);
 
         result = remotePeerBean.getClientAddress();
@@ -72,7 +72,7 @@ public class LocalPeerBeanTest {
         InetAddress clientIP = InetAddress.getLoopbackAddress();
         address = new InetSocketAddress(clientIP, clientPort);
         cnxnFactory = ServerCnxnFactory.createFactory();
-        cnxnFactory.configure(address, 5, false);
+        cnxnFactory.configure(address, 5, -1, false);
         quorumPeer.setCnxnFactory(cnxnFactory);
 
         result = remotePeerBean.getClientAddress();

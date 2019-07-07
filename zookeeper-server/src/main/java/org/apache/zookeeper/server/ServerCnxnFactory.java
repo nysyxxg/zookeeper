@@ -73,11 +73,11 @@ public abstract class ServerCnxnFactory {
      * @return true if the cnxn that contains the sessionId exists in this ServerCnxnFactory
      *         and it's closed. Otherwise false.
      */
-    public boolean closeSession(long sessionId) {
+    public boolean closeSession(long sessionId, ServerCnxn.DisconnectReason reason) {
         ServerCnxn cnxn = sessionMap.remove(sessionId);
         if (cnxn != null) {
             try {
-                cnxn.close();
+                cnxn.close(reason);
             } catch (Exception e) {
                 LOG.warn("exception during session close", e);
             }
@@ -94,16 +94,20 @@ public abstract class ServerCnxnFactory {
         return cnxns.size();
     }
 
-    public ZooKeeperServer getZooKeeperServer() {
+    public final ZooKeeperServer getZooKeeperServer() {
         return zkServer;
     }
 
     public void configure(InetSocketAddress addr, int maxcc) throws IOException {
-        configure(addr, maxcc, false);
+        configure(addr, maxcc, -1);
     }
 
-    public abstract void configure(InetSocketAddress addr, int maxcc, boolean secure)
-            throws IOException;
+    public void configure(InetSocketAddress addr, int maxcc, int backlog) throws IOException {
+        configure(addr, maxcc, backlog, false);
+    }
+
+    public abstract void configure(InetSocketAddress addr, int maxcc,
+            int backlog, boolean secure) throws IOException;
 
     public abstract void reconfigure(InetSocketAddress addr);
 
@@ -129,6 +133,9 @@ public abstract class ServerCnxnFactory {
     public abstract void startup(ZooKeeperServer zkServer, boolean startServer)
             throws IOException, InterruptedException;
 
+    /** The maximum queue length of the ZooKeeper server's socket */
+    public abstract int getSocketListenBacklog();
+
     public abstract void join() throws InterruptedException;
 
     public abstract void shutdown();
@@ -147,7 +154,7 @@ public abstract class ServerCnxnFactory {
         }
     }
 
-    public abstract void closeAll();
+    public abstract void closeAll(ServerCnxn.DisconnectReason reason);
     
     static public ServerCnxnFactory createFactory() throws IOException {
         String serverCnxnFactoryName =
@@ -171,14 +178,26 @@ public abstract class ServerCnxnFactory {
     static public ServerCnxnFactory createFactory(int clientPort,
             int maxClientCnxns) throws IOException
     {
-        return createFactory(new InetSocketAddress(clientPort), maxClientCnxns);
+        return createFactory(new InetSocketAddress(clientPort), maxClientCnxns, -1);
+    }
+
+    static public ServerCnxnFactory createFactory(int clientPort,
+        int maxClientCnxns, int backlog) throws IOException
+    {
+        return createFactory(new InetSocketAddress(clientPort), maxClientCnxns, backlog);
     }
 
     static public ServerCnxnFactory createFactory(InetSocketAddress addr,
             int maxClientCnxns) throws IOException
     {
+        return createFactory(addr, maxClientCnxns, -1);
+    }
+
+    static public ServerCnxnFactory createFactory(InetSocketAddress addr,
+            int maxClientCnxns, int backlog) throws IOException
+    {
         ServerCnxnFactory factory = createFactory();
-        factory.configure(addr, maxClientCnxns);
+        factory.configure(addr, maxClientCnxns, backlog);
         return factory;
     }
 
@@ -249,7 +268,7 @@ public abstract class ServerCnxnFactory {
             if (securityException != null && (loginContextName != null || jaasFile != null)) {
                 String errorMessage = "No JAAS configuration section named '" + serverSection +  "' was found";
                 if (jaasFile != null) {
-                    errorMessage += "in '" + jaasFile + "'.";
+                    errorMessage += " in '" + jaasFile + "'.";
                 }
                 if (loginContextName != null) {
                     errorMessage += " But " + ZooKeeperSaslServer.LOGIN_CONTEXT_NAME_KEY + " was set.";

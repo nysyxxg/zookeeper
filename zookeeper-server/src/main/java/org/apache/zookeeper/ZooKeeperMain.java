@@ -37,7 +37,10 @@ import java.util.NoSuchElementException;
 import org.apache.yetus.audience.InterfaceAudience;
 import org.apache.zookeeper.cli.CliException;
 import org.apache.zookeeper.cli.CommandNotFoundException;
+import org.apache.zookeeper.cli.GetAllChildrenNumberCommand;
+import org.apache.zookeeper.cli.GetEphemeralsCommand;
 import org.apache.zookeeper.cli.MalformedCommandException;
+import org.apache.zookeeper.cli.VersionCommand;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.apache.zookeeper.ZooDefs.Ids;
@@ -122,7 +125,10 @@ public class ZooKeeperMain {
         new ReconfigCommand().addToMap(commandMapCli);
         new GetConfigCommand().addToMap(commandMapCli);
         new RemoveWatchesCommand().addToMap(commandMapCli);
-        
+        new GetEphemeralsCommand().addToMap(commandMapCli);
+        new GetAllChildrenNumberCommand().addToMap(commandMapCli);
+        new VersionCommand().addToMap(commandMapCli);
+
         // add all to commandMap
         for (Entry<String, CliCommand> entry : commandMapCli.entrySet()) {
             commandMap.put(entry.getKey(), entry.getValue().getOptionStr());

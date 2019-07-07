@@ -32,6 +32,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.net.ProtocolException;
+import java.nio.charset.StandardCharsets;
 import java.util.concurrent.TimeUnit;
 
 import static org.hamcrest.Matchers.equalTo;
@@ -52,6 +54,8 @@ public class NettyServerCnxnTest extends ClientBase {
         System.setProperty(ServerCnxnFactory.ZOOKEEPER_SERVER_CNXN_FACTORY,
                 "org.apache.zookeeper.server.NettyServerCnxnFactory");
         NettyServerCnxnFactory.setTestAllocator(TestByteBufAllocator.getInstance());
+        super.maxCnxns = 1;
+        super.exceptionOnFailedConnect = true;
         super.setUp();
     }
 
@@ -77,11 +81,11 @@ public class NettyServerCnxnTest extends ClientBase {
                 serverFactory instanceof NettyServerCnxnFactory);
 
         final ZooKeeper zk = createClient();
-        final ZooKeeperServer zkServer = getServer(serverFactory);
+        final ZooKeeperServer zkServer = serverFactory.getZooKeeperServer();
         final String path = "/a";
         try {
             // make sure zkclient works
-            zk.create(path, "test".getBytes(), Ids.OPEN_ACL_UNSAFE,
+            zk.create(path, "test".getBytes(StandardCharsets.UTF_8), Ids.OPEN_ACL_UNSAFE,
                     CreateMode.PERSISTENT);
             // set on watch
             Assert.assertNotNull("Didn't create znode:" + path,
@@ -109,6 +113,22 @@ public class NettyServerCnxnTest extends ClientBase {
         }
     }
 
+    /**
+     * In the {@link #setUp()} routine, the maximum number of connections per IP
+     * is set to 1. This tests that if more than one connection is attempted, the
+     * connection fails.
+     */
+    @Test(timeout = 40000, expected = ProtocolException.class)
+    public void testMaxConnectionPerIpSurpased() throws Exception {
+        Assert.assertTrue(
+                "Did not instantiate ServerCnxnFactory with NettyServerCnxnFactory!",
+                serverFactory instanceof NettyServerCnxnFactory);
+
+        try (final ZooKeeper zk1 = createClient();
+            final ZooKeeper zk2 = createClient();) {
+        }
+    }
+
     @Test
     public void testClientResponseStatsUpdate() throws IOException, InterruptedException, KeeperException {
         try (ZooKeeper zk = createClient()) {
@@ -116,14 +136,14 @@ public class NettyServerCnxnTest extends ClientBase {
             assertThat("Last client response size should be initialized with INIT_VALUE",
                     clientResponseStats.getLastBufferSize(), equalTo(BufferStats.INIT_VALUE));
 
-            zk.create("/a", "test".getBytes(), Ids.OPEN_ACL_UNSAFE,
+            zk.create("/a", "test".getBytes(StandardCharsets.UTF_8), Ids.OPEN_ACL_UNSAFE,
                     CreateMode.PERSISTENT);
 
             assertThat("Last client response size should be greater than 0 after client request was performed",
                     clientResponseStats.getLastBufferSize(), greaterThan(0));
 
             byte[] contents = zk.getData("/a", null, null);
-            assertArrayEquals("unexpected data", "test".getBytes(), contents);
+            assertArrayEquals("unexpected data", "test".getBytes(StandardCharsets.UTF_8), contents);
         }
     }
 
@@ -134,7 +154,7 @@ public class NettyServerCnxnTest extends ClientBase {
             assertThat("Last client response size should be initialized with INIT_VALUE",
                     clientResponseStats.getLastBufferSize(), equalTo(BufferStats.INIT_VALUE));
 
-            zk.create("/a", "test".getBytes(), Ids.OPEN_ACL_UNSAFE,
+            zk.create("/a", "test".getBytes(StandardCharsets.UTF_8), Ids.OPEN_ACL_UNSAFE,
                     CreateMode.PERSISTENT);
 
             assertThat("Last client response size should be greater than 0 after client request was performed",
@@ -162,7 +182,7 @@ public class NettyServerCnxnTest extends ClientBase {
             }
 
             byte[] contents = zk.getData("/a", null, null);
-            assertArrayEquals("unexpected data", "test".getBytes(), contents);
+            assertArrayEquals("unexpected data", "test".getBytes(StandardCharsets.UTF_8), contents);
 
             // As above, but don't do the throttled read. Make the request bytes wait in the socket
             // input buffer until after throttling is turned off. Need to make sure both modes work.
@@ -180,7 +200,7 @@ public class NettyServerCnxnTest extends ClientBase {
             }
 
             contents = zk.getData("/a", null, null);
-            assertArrayEquals("unexpected data", "test".getBytes(), contents);
+            assertArrayEquals("unexpected data", "test".getBytes(StandardCharsets.UTF_8), contents);
         }
     }
 }

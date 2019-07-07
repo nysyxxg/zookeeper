@@ -21,15 +21,20 @@ package org.apache.zookeeper.server.quorum;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
-import java.io.DataOutputStream;
 import java.io.IOException;
+import java.lang.System;
 import java.net.Socket;
 import java.nio.ByteBuffer;
+import java.util.Date;
 import java.util.Iterator;
+import java.util.Objects;
 import java.util.Queue;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock.ReadLock;
 
@@ -37,8 +42,6 @@ import javax.security.sasl.SaslException;
 
 import org.apache.jute.BinaryInputArchive;
 import org.apache.jute.BinaryOutputArchive;
-import org.apache.jute.Record;
-import org.apache.zookeeper.KeeperException.SessionExpiredException;
 import org.apache.zookeeper.ZooDefs.OpCode;
 import org.apache.zookeeper.server.Request;
 import org.apache.zookeeper.server.ServerMetrics;
@@ -48,6 +51,7 @@ import org.apache.zookeeper.server.ZooKeeperThread;
 import org.apache.zookeeper.server.ZooTrace;
 import org.apache.zookeeper.server.quorum.Leader.Proposal;
 import org.apache.zookeeper.server.quorum.QuorumPeer.LearnerType;
+import org.apache.zookeeper.server.quorum.auth.QuorumAuthServer;
 import org.apache.zookeeper.server.util.SerializeUtils;
 import org.apache.zookeeper.server.util.ZxidUtils;
 import org.apache.zookeeper.txn.TxnHeader;
@@ -68,7 +72,7 @@ public class LearnerHandler extends ZooKeeperThread {
         return sock;
     }
 
-    final Leader leader;
+    final LearnerMaster learnerMaster;
 
     /** Deadline for receiving the next ack. If we are bootstrapping then
      * it's based on the initLimit, if we are done bootstrapping it's based
@@ -85,6 +89,10 @@ public class LearnerHandler extends ZooKeeperThread {
         return sid;
     }
 
+    String getRemoteAddress() {
+        return sock == null ? "<null>" : sock.getRemoteSocketAddress().toString();
+    }
+
     protected int version = 0x1;
 
     int getVersion() {
@@ -96,6 +104,32 @@ public class LearnerHandler extends ZooKeeperThread {
      */
     final LinkedBlockingQueue<QuorumPacket> queuedPackets =
         new LinkedBlockingQueue<QuorumPacket>();
+    private final AtomicLong queuedPacketsSize = new AtomicLong();
+
+    protected final AtomicLong packetsReceived = new AtomicLong();
+    protected final AtomicLong packetsSent = new AtomicLong();
+
+    protected final AtomicLong requestsReceived = new AtomicLong();
+
+    protected volatile long lastZxid = -1;
+
+    public synchronized long getLastZxid() {
+        return lastZxid;
+    }
+
+    protected final Date established = new Date();
+
+    public Date getEstablished() {
+        return (Date)established.clone();
+    }
+
+    /**
+     * Marker packets would be added to quorum packet queue after every
+     * markerPacketInterval packets.
+     * It is ok if packetCounter overflows.
+     */
+    private final int markerPacketInterval = 1000;
+    private AtomicInteger packetCounter = new AtomicInteger();
 
     /**
      * This class controls the time that the Leader has been
@@ -147,12 +181,32 @@ public class LearnerHandler extends ZooKeeperThread {
                 return true;
             } else {
                 long msDelay = (time - currentTime) / 1000000;
-                return (msDelay < (leader.self.tickTime * leader.self.syncLimit));
+                return (msDelay < learnerMaster.syncTimeout());
             }
         }
     };
 
     private SyncLimitCheck syncLimitCheck = new SyncLimitCheck();
+
+    private static class MarkerQuorumPacket extends QuorumPacket {
+        long time;
+        MarkerQuorumPacket(long time) {
+            this.time = time;
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(time);
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+            MarkerQuorumPacket that = (MarkerQuorumPacket) o;
+            return time == that.time;
+        }
+    };
 
     private BinaryInputArchive ia;
 
@@ -161,13 +215,21 @@ public class LearnerHandler extends ZooKeeperThread {
     private final BufferedInputStream bufferedInput;
     private BufferedOutputStream bufferedOutput;
 
+    // for test only
+    protected void setOutputArchive(BinaryOutputArchive oa) {
+        this.oa = oa;
+    }
+    protected void setBufferedOutput(BufferedOutputStream bufferedOutput) {
+        this.bufferedOutput = bufferedOutput;
+    }
+
     /**
      * Keep track of whether we have started send packets thread
      */
     private volatile boolean sendingThreadStarted = false;
 
     /**
-     * For testing purpose, force leader to use snapshot to sync with followers
+     * For testing purpose, force learnerMaster to use snapshot to sync with followers
      */
     public static final String FORCE_SNAP_SYNC = "zookeeper.forceSnapshotSync";
     private boolean forceSnapSync = false;
@@ -183,10 +245,10 @@ public class LearnerHandler extends ZooKeeperThread {
      */
     private long leaderLastZxid;
 
-    LearnerHandler(Socket sock, BufferedInputStream bufferedInput,Leader leader) throws IOException {
+    LearnerHandler(Socket sock, BufferedInputStream bufferedInput, LearnerMaster learnerMaster) throws IOException {
         super("LearnerHandler-" + sock.getRemoteSocketAddress());
         this.sock = sock;
-        this.leader = leader;
+        this.learnerMaster = learnerMaster;
         this.bufferedInput = bufferedInput;
 
         if (Boolean.getBoolean(FORCE_SNAP_SYNC)) {
@@ -195,9 +257,9 @@ public class LearnerHandler extends ZooKeeperThread {
         }
 
         try {
-            if (leader.self != null) {
-                leader.self.authServer.authenticate(sock,
-                        new DataInputStream(bufferedInput));
+            QuorumAuthServer authServer = learnerMaster.getQuorumAuthServer();
+            if (authServer != null) {
+                authServer.authenticate(sock, new DataInputStream(bufferedInput));
             }
         } catch (IOException e) {
             LOG.error("Server failed to authenticate quorum learner, addr: {}, closing connection",
@@ -248,6 +310,17 @@ public class LearnerHandler extends ZooKeeperThread {
                     p = queuedPackets.take();
                 }
 
+                ServerMetrics.getMetrics().LEARNER_HANDLER_QP_SIZE.add(Long.toString(this.sid), queuedPackets.size());
+
+                if (p instanceof MarkerQuorumPacket) {
+                    MarkerQuorumPacket m = (MarkerQuorumPacket)p;
+                    ServerMetrics.getMetrics().LEARNER_HANDLER_QP_TIME.add(
+                            Long.toString(this.sid),
+                            (System.nanoTime() - m.time) / 1000000L);
+                    continue;
+                }
+
+                queuedPacketsSize.addAndGet(-packetSize(p));
                 if (p == proposalOfDeath) {
                     // Packet of death!
                     break;
@@ -261,7 +334,13 @@ public class LearnerHandler extends ZooKeeperThread {
                 if (LOG.isTraceEnabled()) {
                     ZooTrace.logQuorumPacket(LOG, traceMask, 'o', p);
                 }
+
+                // Log the zxid of the last request, if it is a valid zxid.
+                if (p.getZxid() > 0) {
+                    lastZxid = p.getZxid();
+                }
                 oa.writeRecord(p, "packet");
+                packetsSent.incrementAndGet();
             } catch (IOException e) {
                 if (!sock.isClosed()) {
                     LOG.warn("Unexpected exception at " + this, e);
@@ -368,9 +447,8 @@ public class LearnerHandler extends ZooKeeperThread {
     @Override
     public void run() {
         try {
-            leader.addLearnerHandler(this);
-            tickOfNextAckDeadline = leader.self.tick.get()
-                    + leader.self.initLimit + leader.self.syncLimit;
+            learnerMaster.addLearnerHandler(this);
+            tickOfNextAckDeadline = learnerMaster.getTickOfInitialAckDeadline();
 
             ia = BinaryInputArchive.getArchive(bufferedInput);
             bufferedOutput = new BufferedOutputStream(sock.getOutputStream());
@@ -384,6 +462,9 @@ public class LearnerHandler extends ZooKeeperThread {
                 return;
             }
 
+            if (learnerMaster instanceof ObserverMaster && qp.getType() != Leader.OBSERVERINFO) {
+                throw new IOException("Non observer attempting to connect to ObserverMaster. type = " + qp.getType());
+            }
             byte learnerInfoData[] = qp.getData();
             if (learnerInfoData != null) {
                 ByteBuffer bbsid = ByteBuffer.wrap(learnerInfoData);
@@ -395,31 +476,34 @@ public class LearnerHandler extends ZooKeeperThread {
                 }
                 if (learnerInfoData.length >= 20) {
                     long configVersion = bbsid.getLong();
-                    if (configVersion > leader.self.getQuorumVerifier().getVersion()) {
+                    if (configVersion > learnerMaster.getQuorumVerifierVersion()) {
                         throw new IOException("Follower is ahead of the leader (has a later activated configuration)");
                     }
                 }
             } else {
-                this.sid = leader.followerCounter.getAndDecrement();
+                this.sid = learnerMaster.getAndDecrementFollowerCounter();
             }
 
-            if (leader.self.getView().containsKey(this.sid)) {
-                LOG.info("Follower sid: " + this.sid + " : info : "
-                        + leader.self.getView().get(this.sid).toString());
+            String followerInfo = learnerMaster.getPeerInfo(this.sid);
+            if (followerInfo.isEmpty()) {
+                LOG.info("Follower sid: " + this.sid + " not in the current config "
+                        + Long.toHexString(learnerMaster.getQuorumVerifierVersion()));
             } else {
-                LOG.info("Follower sid: " + this.sid + " not in the current config " + Long.toHexString(leader.self.getQuorumVerifier().getVersion()));
+                LOG.info("Follower sid: " + this.sid + " : info : " + followerInfo);
             }
 
             if (qp.getType() == Leader.OBSERVERINFO) {
                   learnerType = LearnerType.OBSERVER;
             }
 
+            learnerMaster.registerLearnerHandlerBean(this, sock);
+
             long lastAcceptedEpoch = ZxidUtils.getEpochFromZxid(qp.getZxid());
 
             long peerLastZxid;
             StateSummary ss = null;
             long zxid = qp.getZxid();
-            long newEpoch = leader.getEpochToPropose(this.getSid(), lastAcceptedEpoch);
+            long newEpoch = learnerMaster.getEpochToPropose(this.getSid(), lastAcceptedEpoch);
             long newLeaderZxid = ZxidUtils.makeZxid(newEpoch, 0);
 
             if (this.getVersion() < 0x10000) {
@@ -427,7 +511,7 @@ public class LearnerHandler extends ZooKeeperThread {
                 long epoch = ZxidUtils.getEpochFromZxid(zxid);
                 ss = new StateSummary(epoch, zxid);
                 // fake the message
-                leader.waitForEpochAck(this.getSid(), ss);
+                learnerMaster.waitForEpochAck(this.getSid(), ss);
             } else {
                 byte ver[] = new byte[4];
                 ByteBuffer.wrap(ver).putInt(0x10000);
@@ -443,21 +527,21 @@ public class LearnerHandler extends ZooKeeperThread {
 				}
                 ByteBuffer bbepoch = ByteBuffer.wrap(ackEpochPacket.getData());
                 ss = new StateSummary(bbepoch.getInt(), ackEpochPacket.getZxid());
-                leader.waitForEpochAck(this.getSid(), ss);
+                learnerMaster.waitForEpochAck(this.getSid(), ss);
             }
             peerLastZxid = ss.getLastZxid();
 
             // Take any necessary action if we need to send TRUNC or DIFF
             // startForwarding() will be called in all cases
-            boolean needSnap = syncFollower(peerLastZxid, leader.zk.getZKDatabase(), leader);
+            boolean needSnap = syncFollower(peerLastZxid, learnerMaster);
 
             /* if we are not truncating or sending a diff just send a snapshot */
             if (needSnap) {
                 boolean exemptFromThrottle = getLearnerType() != LearnerType.OBSERVER;
                 LearnerSnapshot snapshot =
-                        leader.getLearnerSnapshotThrottler().beginSnapshot(exemptFromThrottle);
+                        learnerMaster.getLearnerSnapshotThrottler().beginSnapshot(exemptFromThrottle);
                 try {
-                    long zxidToSend = leader.zk.getZKDatabase().getDataTreeLastProcessedZxid();
+                    long zxidToSend = learnerMaster.getZKDatabase().getDataTreeLastProcessedZxid();
                     oa.writeRecord(new QuorumPacket(Leader.SNAP, zxidToSend, null, null), "packet");
                     bufferedOutput.flush();
 
@@ -470,16 +554,16 @@ public class LearnerHandler extends ZooKeeperThread {
                             snapshot.getConcurrentSnapshotNumber(),
                             snapshot.isEssential() ? "exempt" : "not exempt");
                     // Dump data to peer
-                    leader.zk.getZKDatabase().serializeSnapshot(oa);
+                    learnerMaster.getZKDatabase().serializeSnapshot(oa);
                     oa.writeString("BenWasHere", "signature");
                     bufferedOutput.flush();
                 } finally {
                     snapshot.close();
-                    ServerMetrics.SNAP_COUNT.add(1);
+                    ServerMetrics.getMetrics().SNAP_COUNT.add(1);
                 }
             }
             else {
-                ServerMetrics.DIFF_COUNT.add(1);
+                ServerMetrics.getMetrics().DIFF_COUNT.add(1);
             }
 
             LOG.debug("Sending NEWLEADER message to " + sid);
@@ -492,8 +576,7 @@ public class LearnerHandler extends ZooKeeperThread {
                 oa.writeRecord(newLeaderQP, "packet");
             } else {
                 QuorumPacket newLeaderQP = new QuorumPacket(Leader.NEWLEADER,
-                        newLeaderZxid, leader.self.getLastSeenQuorumVerifier()
-                                .toString().getBytes(), null);
+                        newLeaderZxid, learnerMaster.getQuorumVerifierBytes(), null);
                 queuedPackets.add(newLeaderQP);
             }
             bufferedOutput.flush();
@@ -503,7 +586,7 @@ public class LearnerHandler extends ZooKeeperThread {
 
             /*
              * Have to wait for the first ACK, wait until
-             * the leader is ready, and only then we can
+             * the learnerMaster is ready, and only then we can
              * start processing messages.
              */
             qp = new QuorumPacket();
@@ -517,21 +600,18 @@ public class LearnerHandler extends ZooKeeperThread {
             if(LOG.isDebugEnabled()){
             	LOG.debug("Received NEWLEADER-ACK message from " + sid);
             }
-            leader.waitForNewLeaderAck(getSid(), qp.getZxid());
+            learnerMaster.waitForNewLeaderAck(getSid(), qp.getZxid());
 
             syncLimitCheck.start();
 
             // now that the ack has been processed expect the syncLimit
-            sock.setSoTimeout(leader.self.tickTime * leader.self.syncLimit);
+            sock.setSoTimeout(learnerMaster.syncTimeout());
 
             /*
-             * Wait until leader starts up
+             * Wait until learnerMaster starts up
              */
-            synchronized(leader.zk){
-                while(!leader.zk.isRunning() && !this.isInterrupted()){
-                    leader.zk.wait(20);
-                }
-            }
+            learnerMaster.waitForStartup();
+
             // Mutation packets will be queued during the serialize,
             // so we need to mark when the peer can actually start
             // using the data
@@ -550,8 +630,9 @@ public class LearnerHandler extends ZooKeeperThread {
                 if (LOG.isTraceEnabled()) {
                     ZooTrace.logQuorumPacket(LOG, traceMask, 'i', qp);
                 }
-                tickOfNextAckDeadline = leader.self.tick.get() + leader.self.syncLimit;
+                tickOfNextAckDeadline = learnerMaster.getTickOfNextAckDeadline();
 
+                packetsReceived.incrementAndGet();
 
                 ByteBuffer bb;
                 long sessionId;
@@ -566,7 +647,7 @@ public class LearnerHandler extends ZooKeeperThread {
                         }
                     }
                     syncLimitCheck.updateAck(qp.getZxid());
-                    leader.processAck(this.sid, qp.getZxid(), sock.getLocalSocketAddress());
+                    learnerMaster.processAck(this.sid, qp.getZxid(), sock.getLocalSocketAddress());
                     break;
                 case Leader.PING:
                     // Process the touches
@@ -576,38 +657,12 @@ public class LearnerHandler extends ZooKeeperThread {
                     while (dis.available() > 0) {
                         long sess = dis.readLong();
                         int to = dis.readInt();
-                        leader.zk.touch(sess, to);
+                        learnerMaster.touch(sess, to);
                     }
                     break;
                 case Leader.REVALIDATE:
-                    bis = new ByteArrayInputStream(qp.getData());
-                    dis = new DataInputStream(bis);
-                    long id = dis.readLong();
-                    int to = dis.readInt();
-                    ByteArrayOutputStream bos = new ByteArrayOutputStream();
-                    DataOutputStream dos = new DataOutputStream(bos);
-                    dos.writeLong(id);
-                    boolean valid = leader.zk.checkIfValidGlobalSession(id, to);
-                    if (valid) {
-                        try {
-                            //set the session owner
-                            // as the follower that
-                            // owns the session
-                            leader.zk.setOwner(id, this);
-                        } catch (SessionExpiredException e) {
-                            LOG.error("Somehow session " + Long.toHexString(id) +
-                                    " expired right after being renewed! (impossible)", e);
-                        }
-                    }
-                    if (LOG.isTraceEnabled()) {
-                        ZooTrace.logTraceMessage(LOG,
-                                                 ZooTrace.SESSION_TRACE_MASK,
-                                                 "Session 0x" + Long.toHexString(id)
-                                                 + " is valid: "+ valid);
-                    }
-                    dos.writeBoolean(valid);
-                    qp.setData(bos.toByteArray());
-                    queuedPackets.add(qp);
+                    ServerMetrics.getMetrics().REVALIDATE_COUNT.add(1);
+                    learnerMaster.revalidateSession(qp, this);
                     break;
                 case Leader.REQUEST:
                     bb = ByteBuffer.wrap(qp.getData());
@@ -622,7 +677,8 @@ public class LearnerHandler extends ZooKeeperThread {
                         si = new Request(null, sessionId, cxid, type, bb, qp.getAuthinfo());
                     }
                     si.setOwner(this);
-                    leader.zk.submitLearnerRequest(si);
+                    learnerMaster.submitLearnerRequest(si);
+                    requestsReceived.incrementAndGet();
                     break;
                 default:
                     LOG.warn("unexpected quorum packet, type: {}", packetToString(qp));
@@ -646,9 +702,7 @@ public class LearnerHandler extends ZooKeeperThread {
         } catch (SnapshotThrottleException e) {
             LOG.error("too many concurrent snapshots: " + e);
         } finally {
-            LOG.warn("******* GOODBYE "
-                    + (sock != null ? sock.getRemoteSocketAddress() : "<null>")
-                    + " ********");
+            LOG.warn("******* GOODBYE {} ********", getRemoteAddress());
             shutdown();
         }
     }
@@ -677,23 +731,30 @@ public class LearnerHandler extends ZooKeeperThread {
     }
 
     /**
+     * Tests need not send marker packets as they are only needed to
+     * log quorum packet delays
+     */
+    protected boolean shouldSendMarkerPacketForLogging() {
+        return true;
+    }
+
+    /**
      * Determine if we need to sync with follower using DIFF/TRUNC/SNAP
      * and setup follower to receive packets from commit processor
      *
      * @param peerLastZxid
-     * @param db
-     * @param leader
+     * @param learnerMaster
      * @return true if snapshot transfer is needed.
      */
-    public boolean syncFollower(long peerLastZxid, ZKDatabase db, Leader leader) {
+    boolean syncFollower(long peerLastZxid, LearnerMaster learnerMaster) {
         /*
          * When leader election is completed, the leader will set its
          * lastProcessedZxid to be (epoch < 32). There will be no txn associated
          * with this zxid.
          *
          * The learner will set its lastProcessedZxid to the same value if
-         * it get DIFF or SNAP from the leader. If the same learner come
-         * back to sync with leader using this zxid, we will never find this
+         * it get DIFF or SNAP from the learnerMaster. If the same learner come
+         * back to sync with learnerMaster using this zxid, we will never find this
          * zxid in our history. In this case, we will ignore TRUNC logic and
          * always send DIFF if we have old enough history
          */
@@ -701,6 +762,7 @@ public class LearnerHandler extends ZooKeeperThread {
         // Keep track of the latest zxid which already queued
         long currentZxid = peerLastZxid;
         boolean needSnap = true;
+        ZKDatabase db = learnerMaster.getZKDatabase();
         boolean txnLogSyncEnabled = db.isTxnLogSyncEnabled();
         ReentrantReadWriteLock lock = db.getLogLock();
         ReadLock rl = lock.readLock();
@@ -721,7 +783,7 @@ public class LearnerHandler extends ZooKeeperThread {
             if (db.getCommittedLog().isEmpty()) {
                 /*
                  * It is possible that committedLog is empty. In that case
-                 * setting these value to the latest txn in leader db
+                 * setting these value to the latest txn in learnerMaster db
                  * will reduce the case that we need to handle
                  *
                  * Here is how each case handle by the if block below
@@ -737,7 +799,7 @@ public class LearnerHandler extends ZooKeeperThread {
              * Here are the cases that we want to handle
              *
              * 1. Force sending snapshot (for testing purpose)
-             * 2. Peer and leader is already sync, send empty diff
+             * 2. Peer and learnerMaster is already sync, send empty diff
              * 3. Follower has txn that we haven't seen. This may be old leader
              *    so we need to send TRUNC. However, if peer has newEpochZxid,
              *    we cannot send TRUNC since the follower has no txnlog
@@ -750,7 +812,7 @@ public class LearnerHandler extends ZooKeeperThread {
              */
 
             if (forceSnapSync) {
-                // Force leader to use snapshot to sync with follower
+                // Force learnerMaster to use snapshot to sync with follower
                 LOG.warn("Forcing snapshot sync - should not see this in production");
             } else if (lastProcessedZxid == peerLastZxid) {
                 // Follower is already sync with us, send empty diff
@@ -790,11 +852,24 @@ public class LearnerHandler extends ZooKeeperThread {
                     currentZxid = queueCommittedProposals(txnLogItr, peerLastZxid,
                                                          minCommittedLog, maxCommittedLog);
 
-                    LOG.debug("Queueing committedLog 0x" + Long.toHexString(currentZxid));
-                    Iterator<Proposal> committedLogItr = db.getCommittedLog().iterator();
-                    currentZxid = queueCommittedProposals(committedLogItr, currentZxid,
-                                                         null, maxCommittedLog);
-                    needSnap = false;
+                    if (currentZxid < minCommittedLog) {
+                        LOG.info("Detected gap between end of txnlog: 0x{} and start of committedLog: 0x{}",
+                                Long.toHexString(currentZxid),
+                                Long.toHexString(minCommittedLog));
+                        currentZxid = peerLastZxid;
+                        // Clear out currently queued requests and revert
+                        // to sending a snapshot.
+                        queuedPackets.clear();
+                        needOpPacket = true;
+                    } else {
+                        LOG.debug("Queueing committedLog 0x{}",
+                                Long.toHexString(currentZxid));
+                        Iterator<Proposal> committedLogItr =
+                                db.getCommittedLog().iterator();
+                        currentZxid = queueCommittedProposals(committedLogItr,
+                                currentZxid, null, maxCommittedLog);
+                        needSnap = false;
+                    }
                 }
                 // closing the resources
                 if (txnLogItr instanceof TxnLogProposalIterator) {
@@ -811,9 +886,12 @@ public class LearnerHandler extends ZooKeeperThread {
                         Long.toHexString(peerLastZxid),
                         txnLogSyncEnabled);
             }
+            if (needSnap) {
+                currentZxid = db.getDataTreeLastProcessedZxid();
+            }
             LOG.debug("Start forwarding 0x" + Long.toHexString(currentZxid) +
                       " for peer sid: " +  getSid());
-            leaderLastZxid = leader.startForwarding(this, currentZxid);
+            leaderLastZxid = learnerMaster.startForwarding(this, currentZxid);
         } finally {
             rl.unlock();
         }
@@ -884,7 +962,7 @@ public class LearnerHandler extends ZooKeeperThread {
                    queueOpPacket(Leader.DIFF, lastCommittedZxid);
                    needOpPacket = false;
                 } else if (packetZxid > peerLastZxid  ) {
-                    // Peer have some proposals that the leader hasn't seen yet
+                    // Peer have some proposals that the learnerMaster hasn't seen yet
                     // it may used to be a leader
                     if (ZxidUtils.getEpochFromZxid(packetZxid) !=
                             ZxidUtils.getEpochFromZxid(peerLastZxid)) {
@@ -947,7 +1025,8 @@ public class LearnerHandler extends ZooKeeperThread {
             LOG.warn("Ignoring unexpected exception during socket close", e);
         }
         this.interrupt();
-        leader.removeLearnerHandler(this);
+        learnerMaster.removeLearnerHandler(this);
+        learnerMaster.unregisterLearnerHandlerBean(this);
     }
 
     public long tickOfNextAckDeadline() {
@@ -955,7 +1034,7 @@ public class LearnerHandler extends ZooKeeperThread {
     }
 
     /**
-     * ping calls from the leader to the peers
+     * ping calls from the learnerMaster to the peers
      */
     public void ping() {
         // If learner hasn't sync properly yet, don't send ping packet
@@ -965,9 +1044,7 @@ public class LearnerHandler extends ZooKeeperThread {
         }
         long id;
         if (syncLimitCheck.check(System.nanoTime())) {
-            synchronized(leader) {
-                id = leader.lastProposed;
-            }
+            id = learnerMaster.getLastProposed();
             QuorumPacket ping = new QuorumPacket(Leader.PING, id, null, null);
             queuePacket(ping);
         } else {
@@ -988,11 +1065,49 @@ public class LearnerHandler extends ZooKeeperThread {
 
     void queuePacket(QuorumPacket p) {
         queuedPackets.add(p);
+        // Add a MarkerQuorumPacket at regular intervals.
+        if (shouldSendMarkerPacketForLogging() &&
+                packetCounter.getAndIncrement() % markerPacketInterval == 0) {
+            queuedPackets.add(new MarkerQuorumPacket(System.nanoTime()));
+        }
+        queuedPacketsSize.addAndGet(packetSize(p));
+    }
+
+    static long packetSize(QuorumPacket p) {
+        /* Approximate base size of QuorumPacket: int + long + byte[] + List */
+        long size = 4 + 8 + 8 + 8;
+        byte[] data = p.getData();
+        if (data != null) {
+            size += data.length;
+        }
+        return size;
     }
 
     public boolean synced() {
-        return isAlive()
-        && leader.self.tick.get() <= tickOfNextAckDeadline;
+        return isAlive() && learnerMaster.getCurrentTick() <= tickOfNextAckDeadline;
+    }
+
+    public synchronized Map<String, Object> getLearnerHandlerInfo() {
+        Map<String, Object> info = new LinkedHashMap<>(9);
+        info.put("remote_socket_address", getRemoteAddress());
+        info.put("sid", getSid());
+        info.put("established", getEstablished());
+        info.put("queued_packets", queuedPackets.size());
+        info.put("queued_packets_size", queuedPacketsSize.get());
+        info.put("packets_received", packetsReceived.longValue());
+        info.put("packets_sent", packetsSent.longValue());
+        info.put("requests", requestsReceived.longValue());
+        info.put("last_zxid", getLastZxid());
+
+        return info;
+    }
+
+    public synchronized void resetObserverConnectionStats() {
+        packetsReceived.set(0);
+        packetsSent.set(0);
+        requestsReceived.set(0);
+
+        lastZxid = -1;
     }
 
     /**

@@ -43,7 +43,7 @@ import org.junit.Test;
 
 public class LearnerTest extends ZKTestCase {
     private static final File testData = new File(
-        System.getProperty("test.data.dir", "build/test/data"));
+        System.getProperty("test.data.dir", "src/test/resources/data"));
 
     static class SimpleLearnerZooKeeperServer extends LearnerZooKeeperServer {
 
@@ -51,7 +51,7 @@ public class LearnerTest extends ZKTestCase {
 
         public SimpleLearnerZooKeeperServer(FileTxnSnapLog ftsl, QuorumPeer self)
                 throws IOException {
-            super(ftsl, 2000, 2000, 2000, new ZKDatabase(ftsl), self);
+            super(ftsl, 2000, 2000, 2000, -1, new ZKDatabase(ftsl), self);
         }
 
         @Override

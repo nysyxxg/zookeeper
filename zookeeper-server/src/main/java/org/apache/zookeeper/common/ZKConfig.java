@@ -103,15 +103,24 @@ public class ZKConfig {
         properties.put(KINIT_COMMAND, System.getProperty(KINIT_COMMAND));
         properties.put(JGSS_NATIVE, System.getProperty(JGSS_NATIVE));
 
-        ClientX509Util clientX509Util = new ClientX509Util();
-        putSSLProperties(clientX509Util);
-        properties.put(clientX509Util.getSslAuthProviderProperty(),
-                System.getProperty(clientX509Util.getSslAuthProviderProperty()));
+        try (ClientX509Util clientX509Util = new ClientX509Util()) {
+            putSSLProperties(clientX509Util);
+            properties.put(clientX509Util.getSslAuthProviderProperty(),
+                    System.getProperty(clientX509Util.getSslAuthProviderProperty()));
+        }
 
-        putSSLProperties(new QuorumX509Util());
+        try (X509Util x509Util = new QuorumX509Util()) {
+            putSSLProperties(x509Util);
+        }
     }
     
     private void putSSLProperties(X509Util x509Util) {
+        properties.put(x509Util.getSslProtocolProperty(),
+                System.getProperty(x509Util.getSslProtocolProperty()));
+        properties.put(x509Util.getSslEnabledProtocolsProperty(),
+                System.getProperty(x509Util.getSslEnabledProtocolsProperty()));
+        properties.put(x509Util.getSslCipherSuitesProperty(),
+                System.getProperty(x509Util.getSslCipherSuitesProperty()));
         properties.put(x509Util.getSslKeystoreLocationProperty(),
                 System.getProperty(x509Util.getSslKeystoreLocationProperty()));
         properties.put(x509Util.getSslKeystorePasswdProperty(),
@@ -124,12 +133,18 @@ public class ZKConfig {
                 System.getProperty(x509Util.getSslTruststorePasswdProperty()));
         properties.put(x509Util.getSslTruststoreTypeProperty(),
                 System.getProperty(x509Util.getSslTruststoreTypeProperty()));
+        properties.put(x509Util.getSslContextSupplierClassProperty(),
+                System.getProperty(x509Util.getSslContextSupplierClassProperty()));
         properties.put(x509Util.getSslHostnameVerificationEnabledProperty(),
                 System.getProperty(x509Util.getSslHostnameVerificationEnabledProperty()));
         properties.put(x509Util.getSslCrlEnabledProperty(),
                 System.getProperty(x509Util.getSslCrlEnabledProperty()));
         properties.put(x509Util.getSslOcspEnabledProperty(),
                 System.getProperty(x509Util.getSslOcspEnabledProperty()));
+        properties.put(x509Util.getSslClientAuthProperty(),
+                System.getProperty(x509Util.getSslClientAuthProperty()));
+        properties.put(x509Util.getSslHandshakeDetectionTimeoutMillisProperty(),
+                System.getProperty(x509Util.getSslHandshakeDetectionTimeoutMillisProperty()));
     }
 
     /**

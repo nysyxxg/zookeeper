@@ -6,9 +6,9 @@
  * to you under the Apache License, Version 2.0 (the
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
- * <p/>
+ *
  * http://www.apache.org/licenses/LICENSE-2.0
- * <p/>
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -24,6 +24,7 @@ import java.security.cert.Certificate;
 import org.apache.jute.Record;
 import org.apache.zookeeper.WatchedEvent;
 import org.apache.zookeeper.proto.ReplyHeader;
+import org.apache.zookeeper.data.Stat;
 
 public class MockServerCnxn extends ServerCnxn {
     public Certificate[] clientChain;
@@ -39,11 +40,11 @@ public class MockServerCnxn extends ServerCnxn {
     }
 
     @Override
-    void close() {
+    public void close(DisconnectReason reason) {
     }
 
     @Override
-    public void sendResponse(ReplyHeader h, Record r, String tag)
+    public void sendResponse(ReplyHeader h, Record r, String tag, String cacheKey, Stat stat)
             throws IOException {
     }
 
@@ -80,7 +81,7 @@ public class MockServerCnxn extends ServerCnxn {
     }
 
     @Override
-    void sendBuffer(ByteBuffer closeConn) {
+    void sendBuffer(ByteBuffer... closeConn) {
     }
 
     @Override

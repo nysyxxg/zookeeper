@@ -19,7 +19,6 @@
 package org.apache.zookeeper.server;
 
 import java.io.BufferedWriter;
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.io.Writer;
@@ -36,10 +35,10 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.jute.BinaryInputArchive;
-import org.apache.jute.BinaryOutputArchive;
 import org.apache.jute.Record;
 import org.apache.zookeeper.WatchedEvent;
 import org.apache.zookeeper.data.Id;
+import org.apache.zookeeper.data.Stat;
 import org.apache.zookeeper.proto.ReplyHeader;
 import org.apache.zookeeper.proto.RequestHeader;
 import org.apache.zookeeper.proto.WatcherEvent;
@@ -137,24 +136,31 @@ public class NIOServerCnxn extends ServerCnxn {
      * sendBuffer pushes a byte buffer onto the outgoing buffer queue for
      * asynchronous writes.
      */
-    public void sendBuffer(ByteBuffer bb) {
+    public void sendBuffer(ByteBuffer... buffers) {
         if (LOG.isTraceEnabled()) {
             LOG.trace("Add a buffer to outgoingBuffers, sk " + sk
                       + " is valid: " + sk.isValid());
         }
-        outgoingBuffers.add(bb);
+        synchronized (outgoingBuffers) {
+            for (ByteBuffer buffer : buffers) {
+                outgoingBuffers.add(buffer);
+            }
+            outgoingBuffers.add(packetSentinel);
+        }
         requestInterestOpsUpdate();
     }
 
     /** Read the request payload (everything following the length prefix) */
-    private void readPayload() throws IOException, InterruptedException {
+    private void readPayload() throws IOException, InterruptedException, ClientCnxnLimitException {
         if (incomingBuffer.remaining() != 0) { // have we read length bytes?
             int rc = sock.read(incomingBuffer); // sock is non-blocking, so ok
             if (rc < 0) {
+                ServerMetrics.getMetrics().CONNECTION_DROP_COUNT.add(1);
                 throw new EndOfStreamException(
                         "Unable to read additional data from client sessionid 0x"
                         + Long.toHexString(sessionId)
-                        + ", likely client has closed socket");
+                        + ", likely client has closed socket",
+                        DisconnectReason.UNABLE_TO_READ_FROM_CLIENT);
             }
         }
 
@@ -219,12 +225,15 @@ public class NIOServerCnxn extends ServerCnxn {
             ByteBuffer bb;
             while ((bb = outgoingBuffers.peek()) != null) {
                 if (bb == ServerCnxnFactory.closeConn) {
-                    throw new CloseRequestException("close requested");
+                    throw new CloseRequestException("close requested",
+                        DisconnectReason.CLIENT_CLOSED_CONNECTION);
+                }
+                if (bb == packetSentinel) {
+                    packetSent();
                 }
                 if (bb.remaining() > 0) {
                     break;
                 }
-                packetSent();
                 outgoingBuffers.remove();
             }
          } else {
@@ -267,7 +276,11 @@ public class NIOServerCnxn extends ServerCnxn {
             // Remove the buffers that we have sent
             while ((bb = outgoingBuffers.peek()) != null) {
                 if (bb == ServerCnxnFactory.closeConn) {
-                    throw new CloseRequestException("close requested");
+                    throw new CloseRequestException("close requested",
+                        DisconnectReason.CLIENT_CLOSED_CONNECTION);
+                }
+                if (bb == packetSentinel) {
+                    packetSent();
                 }
                 if (sent < bb.remaining()) {
                     /*
@@ -277,7 +290,6 @@ public class NIOServerCnxn extends ServerCnxn {
                     bb.position(bb.position() + sent);
                     break;
                 }
-                packetSent();
                 /* We've sent the whole buffer, so drop the buffer */
                 sent -= bb.remaining();
                 outgoingBuffers.remove();
@@ -306,10 +318,12 @@ public class NIOServerCnxn extends ServerCnxn {
             if (k.isReadable()) {
                 int rc = sock.read(incomingBuffer);
                 if (rc < 0) {
+                    ServerMetrics.getMetrics().CONNECTION_DROP_COUNT.add(1);
                     throw new EndOfStreamException(
                             "Unable to read additional data from client sessionid 0x"
                             + Long.toHexString(sessionId)
-                            + ", likely client has closed socket");
+                            + ", likely client has closed socket",
+                            DisconnectReason.UNABLE_TO_READ_FROM_CLIENT);
                 }
                 if (incomingBuffer.remaining() == 0) {
                     boolean isPayload;
@@ -335,7 +349,8 @@ public class NIOServerCnxn extends ServerCnxn {
                 handleWrite(k);
 
                 if (!initialized && !getReadInterest() && !getWriteInterest()) {
-                    throw new CloseRequestException("responded to info probe");
+                    throw new CloseRequestException("responded to info probe",
+                        DisconnectReason.INFO_PROBE);
                 }
             }
         } catch (CancelledKeyException e) {
@@ -344,21 +359,29 @@ public class NIOServerCnxn extends ServerCnxn {
             if (LOG.isDebugEnabled()) {
                 LOG.debug("CancelledKeyException stack trace", e);
             }
-            close();
+            close(DisconnectReason.CANCELLED_KEY_EXCEPTION);
         } catch (CloseRequestException e) {
             // expecting close to log session closure
             close();
         } catch (EndOfStreamException e) {
             LOG.warn(e.getMessage());
             // expecting close to log session closure
-            close();
+            close(e.getReason());
+        } catch (ClientCnxnLimitException e) {
+            // Common case exception, print at debug level
+            ServerMetrics.getMetrics().CONNECTION_REJECTED.add(1);
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("Exception causing close of session 0x"
+                          + Long.toHexString(sessionId) + ": " + e.getMessage());
+            }
+            close(DisconnectReason.CLIENT_CNX_LIMIT);
         } catch (IOException e) {
             LOG.warn("Exception causing close of session 0x"
                      + Long.toHexString(sessionId) + ": " + e.getMessage());
             if (LOG.isDebugEnabled()) {
                 LOG.debug("IOException stack trace", e);
             }
-            close();
+            close(DisconnectReason.IO_EXCEPTION);
         }
     }
 
@@ -399,7 +422,7 @@ public class NIOServerCnxn extends ServerCnxn {
         }
     }
 
-    private void readConnectRequest() throws IOException, InterruptedException {
+    private void readConnectRequest() throws IOException, InterruptedException, ClientCnxnLimitException {
         if (!isZKServerRunning()) {
             throw new IOException("ZooKeeperServer not running");
         }
@@ -558,11 +581,17 @@ public class NIOServerCnxn extends ServerCnxn {
                " sessionId: 0x" + Long.toHexString(sessionId);
     }
 
+
     /**
      * Close the cnxn and remove it from the factory cnxns list.
      */
     @Override
-    public void close() {
+    public void close(DisconnectReason reason) {
+        disconnectReason = reason;
+        close();
+    }
+
+    private void close() {
         setStale();
         if (!factory.removeCnxn(this)) {
             return;
@@ -648,16 +677,34 @@ public class NIOServerCnxn extends ServerCnxn {
         }
     }
 
-    /*
-     * (non-Javadoc)
+    private final static ByteBuffer packetSentinel = ByteBuffer.allocate(0);
+
+    /**
+     * Serializes a ZooKeeper response and enqueues it for sending.
      *
-     * @see org.apache.zookeeper.server.ServerCnxnIface#sendResponse(org.apache.zookeeper.proto.ReplyHeader,
-     *      org.apache.jute.Record, java.lang.String)
+     * Serializes client response parts and enqueues them into outgoing queue.
+     *
+     * If both cache key and last modified zxid are provided, the serialized
+     * response is caсhed under the provided key, the last modified zxid is
+     * stored along with the value. A cache entry is invalidated if the
+     * provided last modified zxid is more recent than the stored one.
+     *
+     * Attention: this function is not thread safe, due to caching not being
+     * thread safe.
+     *
+     * @param h reply header
+     * @param r reply payload, can be null
+     * @param tag Jute serialization tag, can be null
+     * @param cacheKey key for caching the serialized payload. a null value
+     *     prvents caching
+     * @param stat stat information for the the reply payload, used
+     *     for cache invalidation. a value of 0 prevents caching.
      */
     @Override
-    public void sendResponse(ReplyHeader h, Record r, String tag) {
+    public void sendResponse(ReplyHeader h, Record r, String tag,
+                             String cacheKey, Stat stat) {
         try {
-            super.sendResponse(h, r, tag);
+            sendBuffer(serialize(h, r, tag, cacheKey, stat));
             decrOutstandingAndCheckThrottle(h);
          } catch(Exception e) {
             LOG.warn("Unexpected exception. Destruction averted.", e);
@@ -682,7 +729,7 @@ public class NIOServerCnxn extends ServerCnxn {
         // Convert WatchedEvent to a type that can be sent over the wire
         WatcherEvent e = event.getWrapper();
 
-        sendResponse(h, e, "notification");
+        sendResponse(h, e, "notification", null, null);
     }
 
     /*

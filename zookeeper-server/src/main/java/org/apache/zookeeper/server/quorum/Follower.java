@@ -19,8 +19,9 @@
 package org.apache.zookeeper.server.quorum;
 
 import java.io.IOException;
-import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
+import java.util.Collections;
+import java.util.Map;
 
 import org.apache.jute.Record;
 import org.apache.zookeeper.ZooDefs.OpCode;
@@ -42,7 +43,9 @@ public class Follower extends Learner{
     private long lastQueued;
     // This is the same object as this.zk, but we cache the downcast op
     final FollowerZooKeeperServer fzk;
-    
+
+    ObserverMaster om;
+
     Follower(QuorumPeer self,FollowerZooKeeperServer zk) {
         this.self = self;
         this.zk=zk;
@@ -68,7 +71,7 @@ public class Follower extends Learner{
         self.end_fle = Time.currentElapsedTime();
         long electionTimeTaken = self.end_fle - self.start_fle;
         self.setElectionTimeTaken(electionTimeTaken);
-        ServerMetrics.ELECTION_TIME.add(electionTimeTaken);
+        ServerMetrics.getMetrics().ELECTION_TIME.add(electionTimeTaken);
         LOG.info("FOLLOWING - LEADER ELECTION TOOK - {} {}", electionTimeTaken,
                 QuorumPeer.FLE_TIME_UNIT);
         self.start_fle = 0;
@@ -91,11 +94,21 @@ public class Follower extends Learner{
                 }
                 long startTime = Time.currentElapsedTime();
                 try {
+                    self.setLeaderAddressAndId(leaderServer.addr, leaderServer.getId());
                     syncWithLeader(newEpochZxid);
                 } finally {
                     long syncTime = Time.currentElapsedTime() - startTime;
-                    ServerMetrics.FOLLOWER_SYNC_TIME.add(syncTime);
+                    ServerMetrics.getMetrics().FOLLOWER_SYNC_TIME.add(syncTime);
                 }
+                if (self.getObserverMasterPort() > 0) {
+                    LOG.info("Starting ObserverMaster");
+
+                    om = new ObserverMaster(self, fzk, self.getObserverMasterPort());
+                    om.start();
+                } else {
+                    om = null;
+                }
+                // create a reusable packet to reduce gc impact
                 QuorumPacket qp = new QuorumPacket();
                 while (this.isRunning()) {
                     readPacket(qp);
@@ -103,16 +116,15 @@ public class Follower extends Learner{
                 }
             } catch (Exception e) {
                 LOG.warn("Exception when following the leader", e);
-                try {
-                    sock.close();
-                } catch (IOException e1) {
-                    e1.printStackTrace();
-                }
+                closeSocket();
     
                 // clear pending revalidations
                 pendingRevalidations.clear();
             }
         } finally {
+            if (om != null) {
+                om.stop();
+            }
             zk.unregisterJMX((Learner)this);
         }
     }
@@ -127,7 +139,8 @@ public class Follower extends Learner{
         case Leader.PING:            
             ping(qp);            
             break;
-        case Leader.PROPOSAL:           
+        case Leader.PROPOSAL:
+            ServerMetrics.getMetrics().LEARNER_PROPOSAL_RECEIVED_COUNT.add(1);
             TxnHeader hdr = new TxnHeader();
             Record txn = SerializeUtils.deserializeTxn(qp.getData(), hdr);
             if (hdr.getZxid() != lastQueued + 1) {
@@ -145,9 +158,32 @@ public class Follower extends Learner{
             }
             
             fzk.logRequest(hdr, txn);
+            if (hdr != null) {
+                /*
+                 * Request header is created only by the leader, so this is only set
+                 * for quorum packets. If there is a clock drift, the latency may be
+                 * negative. Headers use wall time, not CLOCK_MONOTONIC.
+                 */
+                long now = Time.currentWallTime();
+                long latency = now - hdr.getTime();
+                if (latency > 0) {
+                    ServerMetrics.getMetrics().PROPOSAL_LATENCY.add(latency);
+                }
+            }
+            if (om != null) {
+                final long startTime = Time.currentElapsedTime();
+                om.proposalReceived(qp);
+                ServerMetrics.getMetrics().OM_PROPOSAL_PROCESS_TIME.add(Time.currentElapsedTime() - startTime);
+            }
             break;
         case Leader.COMMIT:
+            ServerMetrics.getMetrics().LEARNER_COMMIT_RECEIVED_COUNT.add(1);
             fzk.commit(qp.getZxid());
+            if (om != null) {
+                final long startTime = Time.currentElapsedTime();
+                om.proposalCommitted(qp.getZxid());
+                ServerMetrics.getMetrics().OM_COMMIT_PROCESS_TIME.add(Time.currentElapsedTime() - startTime);
+            }
             break;
             
         case Leader.COMMITANDACTIVATE:
@@ -159,11 +195,16 @@ public class Follower extends Learner{
            // get new designated leader from (current) leader's message
            ByteBuffer buffer = ByteBuffer.wrap(qp.getData());    
            long suggestedLeaderId = buffer.getLong();
-            boolean majorChange = 
-                   self.processReconfig(qv, suggestedLeaderId, qp.getZxid(), true);
-           // commit (writes the new config to ZK tree (/zookeeper/config)                     
-           fzk.commit(qp.getZxid());
-            if (majorChange) {
+           final long zxid = qp.getZxid();
+           boolean majorChange =
+                   self.processReconfig(qv, suggestedLeaderId, zxid, true);
+           // commit (writes the new config to ZK tree (/zookeeper/config)
+           fzk.commit(zxid);
+
+           if (om != null) {
+               om.informAndActivate(zxid, suggestedLeaderId);
+           }
+           if (majorChange) {
                throw new Exception("changes proposed in reconfig");
            }
            break;
@@ -171,7 +212,9 @@ public class Follower extends Learner{
             LOG.error("Received an UPTODATE message after Follower started");
             break;
         case Leader.REVALIDATE:
-            revalidate(qp);
+            if (om == null || !om.revalidateLearnerSession(qp)) {
+                revalidate(qp);
+            }
             break;
         case Leader.SYNC:
             fzk.sync();
@@ -203,6 +246,23 @@ public class Follower extends Learner{
      */
     protected long getLastQueued() {
         return lastQueued;
+    }
+
+    public Integer getSyncedObserverSize() {
+        return  om == null ? null : om.getNumActiveObservers();
+    }
+
+    public Iterable<Map<String, Object>> getSyncedObserversInfo() {
+        if (om != null && om.getNumActiveObservers() > 0) {
+            return om.getActiveObservers();
+        }
+        return Collections.emptySet();
+    }
+
+    public void resetObserverConnectionStats() {
+        if (om != null && om.getNumActiveObservers() > 0) {
+            om.resetObserverConnectionStats();
+        }
     }
 
     @Override

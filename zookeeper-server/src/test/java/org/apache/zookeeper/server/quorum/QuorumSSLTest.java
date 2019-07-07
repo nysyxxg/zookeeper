@@ -80,7 +80,6 @@ import org.bouncycastle.util.io.pem.PemWriter;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
-import org.junit.Ignore;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.Timeout;
@@ -125,7 +124,7 @@ public class QuorumSSLTest extends QuorumPeerTestBase {
     private static final char[] PASSWORD = "testpass".toCharArray();
     private static final String HOSTNAME = "localhost";
 
-    private QuorumX509Util quorumX509Util = new QuorumX509Util();
+    private QuorumX509Util quorumX509Util;
 
     private MainThread q1;
     private MainThread q2;
@@ -157,6 +156,7 @@ public class QuorumSSLTest extends QuorumPeerTestBase {
 
     @Before
     public void setup() throws Exception {
+        quorumX509Util = new QuorumX509Util();
         ClientBase.setupTestEnv();
 
         tmpDir = createTmpDir().getAbsolutePath();
@@ -407,6 +407,7 @@ public class QuorumSSLTest extends QuorumPeerTestBase {
         }
 
         Security.removeProvider("BC");
+        quorumX509Util.close();
     }
 
     private void clearSSLSystemProperties() {
@@ -442,7 +443,6 @@ public class QuorumSSLTest extends QuorumPeerTestBase {
         Assert.assertFalse(ClientBase.waitForServerUp("127.0.0.1:" + clientPortQp3, CONNECTION_TIMEOUT));
     }
 
-    @Ignore("portUnification is currently broken and disabled")
     @Test
     public void testRollingUpgrade() throws Exception {
         // Form a quorum without ssl

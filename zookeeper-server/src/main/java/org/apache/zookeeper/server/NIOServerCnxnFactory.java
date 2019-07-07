@@ -310,6 +310,7 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
                 acceptErrorLogger.flush();
             } catch (IOException e) {
                 // accept, maxClientCnxns, configureBlocking
+                ServerMetrics.getMetrics().CONNECTION_REJECTED.add(1);
                 acceptErrorLogger.rateLimitLog(
                     "Error accepting new connection: " + e.getMessage());
                 fastCloseSock(sc);
@@ -403,7 +404,7 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
                 for (SelectionKey key : selector.keys()) {
                     NIOServerCnxn cnxn = (NIOServerCnxn) key.attachment();
                     if (cnxn.isSelectable()) {
-                        cnxn.close();
+                        cnxn.close(ServerCnxn.DisconnectReason.SERVER_SHUTDOWN);
                     }
                     cleanupSelectionKey(key);
                 }
@@ -531,7 +532,7 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
 
                 // Check if we shutdown or doIO() closed this connection
                 if (stopped) {
-                    cnxn.close();
+                    cnxn.close(ServerCnxn.DisconnectReason.SERVER_SHUTDOWN);
                     return;
                 }
                 if (!key.isValid()) {
@@ -547,13 +548,13 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
             // on the current set of interest ops, which may have changed
             // as a result of the I/O operations we just performed.
             if (!selectorThread.addInterestOpsUpdateRequest(key)) {
-                cnxn.close();
+                cnxn.close(ServerCnxn.DisconnectReason.CONNECTION_MODE_CHANGED);
             }
         }
 
         @Override
         public void cleanup() {
-            cnxn.close();
+            cnxn.close(ServerCnxn.DisconnectReason.CLEAN_UP);
         }
     }
 
@@ -575,7 +576,8 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
                         continue;
                     }
                     for (NIOServerCnxn conn : cnxnExpiryQueue.poll()) {
-                        conn.close();
+                        ServerMetrics.getMetrics().SESSIONLESS_CONNECTIONS_EXPIRED.add(1);
+                        conn.close(ServerCnxn.DisconnectReason.CONNECTION_EXPIRED);
                     }
                 }
 
@@ -609,6 +611,7 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
         new ConcurrentHashMap<InetAddress, Set<NIOServerCnxn>>( );
 
     protected int maxClientCnxns = 60;
+    int listenBacklog = -1;
 
     int sessionlessCnxnTimeout;
     private ExpiryQueue<NIOServerCnxn> cnxnExpiryQueue;
@@ -636,7 +639,7 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
         new HashSet<SelectorThread>();
 
     @Override
-    public void configure(InetSocketAddress addr, int maxcc, boolean secure) throws IOException {
+    public void configure(InetSocketAddress addr, int maxcc, int backlog, boolean secure) throws IOException {
         if (secure) {
             throw new UnsupportedOperationException("SSL isn't supported in NIOServerCnxn");
         }
@@ -678,10 +681,15 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
             selectorThreads.add(new SelectorThread(i));
         }
 
+        listenBacklog = backlog;
         this.ss = ServerSocketChannel.open();
         ss.socket().setReuseAddress(true);
         LOG.info("binding to port " + addr);
-        ss.socket().bind(addr);
+        if (listenBacklog == -1) {
+          ss.socket().bind(addr);
+        } else {
+          ss.socket().bind(addr, listenBacklog);
+        }
         ss.configureBlocking(false);
         acceptThread = new AcceptThread(ss, addr, selectorThreads);
     }
@@ -729,6 +737,11 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
     /** {@inheritDoc} */
     public void setMaxClientCnxnsPerHost(int max) {
         maxClientCnxns = max;
+    }
+
+    /** {@inheritDoc} */
+    public int getSocketListenBacklog() {
+        return listenBacklog;
     }
 
     @Override
@@ -854,12 +867,12 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
      */
     @Override
     @SuppressWarnings("unchecked")
-    public void closeAll() {
+    public void closeAll(ServerCnxn.DisconnectReason reason) {
         // clear all the connections on which we are selecting
         for (ServerCnxn cnxn : cnxns) {
             try {
                 // This will remove the cnxn from cnxns
-                cnxn.close();
+                cnxn.close(reason);
             } catch (Exception e) {
                 LOG.warn("Ignoring exception closing cnxn sessionid 0x"
                          + Long.toHexString(cnxn.getSessionId()), e);
@@ -908,7 +921,7 @@ public class NIOServerCnxnFactory extends ServerCnxnFactory {
             join();
 
             // close all open connections
-            closeAll();
+            closeAll(ServerCnxn.DisconnectReason.SERVER_SHUTDOWN);
 
             if (login != null) {
                 login.shutdown();

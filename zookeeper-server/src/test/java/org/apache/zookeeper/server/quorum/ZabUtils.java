@@ -112,6 +112,9 @@ public class ZabUtils {
         public int getMaxClientCnxnsPerHost() {
             return 0;
         }
+        public int getSocketListenBacklog() {
+            return -1;
+        }
         public int getLocalPort() {
             return 0;
         }
@@ -121,14 +124,16 @@ public class ZabUtils {
         public Iterable<ServerCnxn> getConnections() {
             return null;
         }
-        public void configure(InetSocketAddress addr, int maxcc, boolean secure)
-                throws IOException {
+        public void configure(InetSocketAddress addr, int maxcc, int listenBacklog,
+                boolean secure) throws IOException {
         }
 
-        public boolean closeSession(long sessionId) {
+        @Override
+        public boolean closeSession(long sessionId, ServerCnxn.DisconnectReason reason) {
             return false;
         }
-        public void closeAll() {
+        @Override
+        public void closeAll(ServerCnxn.DisconnectReason reason) {
         }
         @Override
         public int getNumAliveConnections() {

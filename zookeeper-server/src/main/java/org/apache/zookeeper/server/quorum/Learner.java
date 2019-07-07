@@ -28,7 +28,8 @@ import java.net.ConnectException;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.ByteBuffer;
-import java.util.LinkedList;
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.concurrent.ConcurrentHashMap;
@@ -38,9 +39,7 @@ import org.apache.jute.BinaryOutputArchive;
 import org.apache.jute.InputArchive;
 import org.apache.jute.OutputArchive;
 import org.apache.jute.Record;
-import org.apache.zookeeper.common.QuorumX509Util;
 import org.apache.zookeeper.common.X509Exception;
-import org.apache.zookeeper.common.X509Util;
 import org.apache.zookeeper.server.ExitCode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -74,8 +73,6 @@ public class Learner {
     
     protected Socket sock;
 
-    protected X509Util x509Util;
-    
     /**
      * Socket getter
      * @return 
@@ -91,9 +88,17 @@ public class Learner {
     
     protected static final Logger LOG = LoggerFactory.getLogger(Learner.class);
 
+    /**
+     * Time to wait after connection attempt with the Leader or LearnerMaster before this
+     * Learner tries to connect again.
+     */
+    private static final int leaderConnectDelayDuringRetryMs =
+            Integer.getInteger("zookeeper.leaderConnectDelayDuringRetryMs", 100);
+
     static final private boolean nodelay = System.getProperty("follower.nodelay", "true").equals("true");
     static {
-        LOG.info("TCP NoDelay set to: " + nodelay);
+        LOG.info("leaderConnectDelayDuringRetryMs: {}", leaderConnectDelayDuringRetryMs);
+        LOG.info("TCP NoDelay set to: {}", nodelay);
     }   
     
     final ConcurrentHashMap<Long, ServerCnxn> pendingRevalidations =
@@ -110,7 +115,6 @@ public class Learner {
      *                the client to be revalidated
      * @param timeout
      *                the timeout for which the session is valid
-     * @return
      * @throws IOException
      */
     void validateSession(ServerCnxn cnxn, long clientId, int timeout)
@@ -239,12 +243,13 @@ public class Learner {
     }
 
     /**
-     * Establish a connection with the Leader found by findLeader. Retries
-     * until either initLimit time has elapsed or 5 tries have happened. 
-     * @param addr - the address of the Leader to connect to.
+     * Establish a connection with the LearnerMaster found by findLearnerMaster.
+     * Followers only connect to Leaders, Observers can connect to any active LearnerMaster.
+     * Retries until either initLimit time has elapsed or 5 tries have happened.
+     * @param addr - the address of the Peer to connect to.
      * @throws IOException - if the socket connection fails on the 5th attempt
-     * <li>if there is an authentication failure while connecting to leader</li>
-     * @throws ConnectException
+     * if there is an authentication failure while connecting to leader
+     * @throws X509Exception
      * @throws InterruptedException
      */
     protected void connectToLeader(InetSocketAddress addr, String hostname)
@@ -252,7 +257,7 @@ public class Learner {
         this.sock = createSocket();
 
         int initLimitTime = self.tickTime * self.initLimit;
-        int remainingInitLimitTime = initLimitTime;
+        int remainingInitLimitTime;
         long startNanoTime = nanoTime();
 
         for (int tries = 0; tries < 5; tries++) {
@@ -290,7 +295,7 @@ public class Learner {
                     this.sock = createSocket();
                 }
             }
-            Thread.sleep(1000);
+            Thread.sleep(leaderConnectDelayDuringRetryMs);
         }
 
         self.authLearner.authenticate(sock, hostname);
@@ -304,10 +309,7 @@ public class Learner {
     private Socket createSocket() throws X509Exception, IOException {
         Socket sock;
         if (self.isSslQuorum()) {
-            if (x509Util == null) {
-                x509Util = new QuorumX509Util();
-            }
-            sock = x509Util.createSSLSocket();
+            sock = self.getX509Util().createSSLSocket();
         } else {
             sock = new Socket();
         }
@@ -316,8 +318,8 @@ public class Learner {
     }
 
     /**
-     * Once connected to the leader, perform the handshake protocol to
-     * establish a following / observing connection. 
+     * Once connected to the leader or learner master, perform the handshake
+     * protocol to establish a following / observing connection.
      * @param pktType
      * @return the zxid the Leader sends for synchronization purposes.
      * @throws IOException
@@ -376,7 +378,8 @@ public class Learner {
     } 
     
     /**
-     * Finally, synchronize our history with the Leader. 
+     * Finally, synchronize our history with the Leader (if Follower)
+     * or the LearnerMaster (if Observer).
      * @param newLeaderZxid
      * @throws IOException
      * @throws InterruptedException
@@ -393,8 +396,8 @@ public class Learner {
         boolean snapshotNeeded = true;
         boolean syncSnapshot = false;
         readPacket(qp);
-        LinkedList<Long> packetsCommitted = new LinkedList<Long>();
-        LinkedList<PacketInFlight> packetsNotCommitted = new LinkedList<PacketInFlight>();
+        Deque<Long> packetsCommitted = new ArrayDeque<>();
+        Deque<PacketInFlight> packetsNotCommitted = new ArrayDeque<>();
         synchronized (zk) {
             if (qp.getType() == Leader.DIFF) {
                 LOG.info("Getting a diff from the leader 0x{}", Long.toHexString(qp.getZxid()));
@@ -670,6 +673,7 @@ public class Learner {
         self.setZooKeeperServer(null);
         self.closeAllConnections();
         self.adminServer.setZooKeeperServer(null);
+        closeSocket();
         // shutdown previous zookeeper
         if (zk != null) {
             zk.shutdown();
@@ -678,5 +682,15 @@ public class Learner {
 
     boolean isRunning() {
         return self.isRunning() && zk.isRunning();
+    }
+
+    void closeSocket() {
+        try {
+            if (sock != null) {
+                sock.close();
+            }
+        } catch (IOException e) {
+            LOG.warn("Ignoring error closing connection to leader", e);
+        }
     }
 }

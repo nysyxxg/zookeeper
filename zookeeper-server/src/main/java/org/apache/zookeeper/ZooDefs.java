@@ -18,6 +18,7 @@
 
 package org.apache.zookeeper;
 
+import edu.umd.cs.findbugs.annotations.SuppressFBWarnings;
 import java.util.ArrayList;
 import java.util.Collections;
 
@@ -74,11 +75,17 @@ public class ZooDefs {
 
         public final int createTTL = 21;
 
+        public final int multiRead = 22;
+
         public final int auth = 100;
 
         public final int setWatches = 101;
 
         public final int sasl = 102;
+
+        public final int getEphemerals = 103;
+
+        public final int getAllChildrenNumber = 104;
 
         public final int createSession = -10;
 
@@ -118,18 +125,21 @@ public class ZooDefs {
         /**
          * This is a completely open ACL .
          */
+        @SuppressFBWarnings(value = "MS_MUTABLE_COLLECTION", justification = "Cannot break API")
         public final ArrayList<ACL> OPEN_ACL_UNSAFE = new ArrayList<ACL>(
                 Collections.singletonList(new ACL(Perms.ALL, ANYONE_ID_UNSAFE)));
 
         /**
          * This ACL gives the creators authentication id's all permissions.
          */
+        @SuppressFBWarnings(value = "MS_MUTABLE_COLLECTION", justification = "Cannot break API")
         public final ArrayList<ACL> CREATOR_ALL_ACL = new ArrayList<ACL>(
                 Collections.singletonList(new ACL(Perms.ALL, AUTH_IDS)));
 
         /**
          * This ACL gives the world the ability to read.
          */
+        @SuppressFBWarnings(value = "MS_MUTABLE_COLLECTION", justification = "Cannot break API")
         public final ArrayList<ACL> READ_ACL_UNSAFE = new ArrayList<ACL>(
                 Collections
                         .singletonList(new ACL(Perms.READ, ANYONE_ID_UNSAFE)));

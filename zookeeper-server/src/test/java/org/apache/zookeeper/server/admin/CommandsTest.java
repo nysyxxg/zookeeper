@@ -31,6 +31,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
+import org.apache.zookeeper.metrics.MetricsUtils;
 
 import org.apache.zookeeper.server.ServerCnxnFactory;
 import org.apache.zookeeper.server.ServerMetrics;
@@ -50,11 +51,8 @@ public class CommandsTest extends ClientBase {
      *            - the primary name of the command
      * @param kwargs
      *            - keyword arguments to the command
-     * @param keys
-     *            - the keys that are expected in the returned Map
-     * @param types
-     *            - the classes of the values in the returned Map. types[i] is
-     *            the type of the value for keys[i].
+     * @param fields
+     *            - the fields that are expected in the returned Map
      * @throws IOException
      * @throws InterruptedException
      */
@@ -109,7 +107,8 @@ public class CommandsTest extends ClientBase {
                     new Field("max_client_cnxns", Integer.class),
                     new Field("min_session_timeout", Integer.class),
                     new Field("max_session_timeout", Integer.class),
-                    new Field("server_id", Long.class));
+                    new Field("server_id", Long.class),
+                    new Field("client_port_listen_backlog", Integer.class));
     }
 
     @Test
@@ -118,6 +117,18 @@ public class CommandsTest extends ClientBase {
                     new Field("connections", Iterable.class),
                     new Field("secure_connections", Iterable.class)
                 );
+    }
+
+    @Test
+    public void testObservers() throws IOException, InterruptedException {
+        testCommand("observers",
+                new Field("synced_observers", Integer.class),
+                new Field("observers", Iterable.class));
+    }
+
+    @Test
+    public void testObserverConnectionStatReset() throws IOException, InterruptedException {
+        testCommand("observer_connection_stat_reset");
     }
 
     @Test
@@ -168,10 +179,17 @@ public class CommandsTest extends ClientBase {
     }
 
     @Test
+    public void testLastSnapshot() throws IOException, InterruptedException {
+        testCommand("last_snapshot",
+                    new Field("zxid", String.class),
+                    new Field("timestamp", Long.class));
+    }
+
+    @Test
     public void testMonitor() throws IOException, InterruptedException {
         ArrayList<Field> fields = new ArrayList<>(Arrays.asList(
                 new Field("version", String.class),
-                new Field("avg_latency", Long.class),
+                new Field("avg_latency", Double.class),
                 new Field("max_latency", Long.class),
                 new Field("min_latency", Long.class),
                 new Field("packets_received", Long.class),
@@ -190,10 +208,26 @@ public class CommandsTest extends ClientBase {
                 new Field("min_client_response_size", Integer.class),
                 new Field("uptime", Long.class),
                 new Field("global_sessions", Long.class),
-                new Field("local_sessions", Long.class)
-        ));
-        for (String metric : ServerMetrics.getAllValues().keySet()) {
-            fields.add(new Field(metric, Long.class));
+                new Field("local_sessions", Long.class),
+                new Field("connection_drop_probability", Double.class)
+        ));        
+        Map<String, Object> metrics = MetricsUtils.currentServerMetrics();
+        
+        for (String metric : metrics.keySet()) {
+            boolean alreadyDefined = fields
+                    .stream()
+                    .anyMatch(f -> {
+                        return f.key.equals(metric);
+                    });
+            if (alreadyDefined) {
+                // known metrics are defined statically in the block above
+                continue;
+            }
+            if (metric.startsWith("avg_")) {
+                fields.add(new Field(metric, Double.class));  
+            } else {
+                fields.add(new Field(metric, Long.class));
+            }
         }
         Field fieldsArray[] = fields.toArray(new Field[0]);
         testCommand("monitor", fieldsArray);

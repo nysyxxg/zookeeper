@@ -68,15 +68,34 @@ public class FastLeaderElection implements Election {
      * the system up again after long partitions. Currently 60 seconds.
      */
 
-    final static int maxNotificationInterval = 60000;
+    private static int maxNotificationInterval = 60000;
 
     /**
-     * This value is passed to the methods that check the quorum
-     * majority of an established ensemble for those values that
-     * should not be taken into account in the comparison
-     * (electionEpoch and zxid).
+     * Lower bound for notification check. The observer don't need to use
+     * the same lower bound as participant members
      */
-    final static int IGNOREVALUE = -1;
+    private static int minNotificationInterval = finalizeWait;
+
+    /**
+     * Minimum notification interval, default is equal to finalizeWait
+     */
+    public static final String MIN_NOTIFICATION_INTERVAL =
+            "zookeeper.fastleader.minNotificationInterval";
+
+    /**
+     * Maximum notification interval, default is 60s
+     */
+    public static final String MAX_NOTIFICATION_INTERVAL =
+            "zookeeper.fastleader.maxNotificationInterval";
+
+    static {
+        minNotificationInterval = Integer.getInteger(MIN_NOTIFICATION_INTERVAL,
+                minNotificationInterval);
+        LOG.info("{}={}", MIN_NOTIFICATION_INTERVAL, minNotificationInterval);
+        maxNotificationInterval = Integer.getInteger(MAX_NOTIFICATION_INTERVAL,
+                maxNotificationInterval);
+        LOG.info("{}={}", MAX_NOTIFICATION_INTERVAL, maxNotificationInterval);
+    }
 
     /**
      * Connection manager. Fast leader election uses TCP for
@@ -692,16 +711,12 @@ public class FastLeaderElection implements Election {
         }
     }
 
-    private void printNotification(Notification n){
-        LOG.info("Notification: "
-                + Long.toHexString(n.version) + " (message format version), "
-                + n.leader + " (n.leader), 0x"
-                + Long.toHexString(n.zxid) + " (n.zxid), 0x"
-                + Long.toHexString(n.electionEpoch) + " (n.round), " + n.state
-                + " (n.state), " + n.sid + " (n.sid), 0x"
-                + Long.toHexString(n.peerEpoch) + " (n.peerEPoch), "
-                + self.getPeerState() + " (my state)"
-                + (n.qv!=null ? (Long.toHexString(n.qv.getVersion()) + " (n.config version)"):""));
+    private void printNotification(Notification n) {
+        LOG.info("Notification: my state:{}; n.sid:{}, n.state:{}, n.leader:{}, n.round:0x{}, " +
+                        "n.peerEpoch:0x{}, n.zxid:0x{}, message format version:0x{}, n.config version:0x{}",
+                self.getPeerState(), n.sid, n.state, n.leader, Long.toHexString(n.electionEpoch),
+                Long.toHexString(n.peerEpoch), Long.toHexString(n.zxid), Long.toHexString(n.version),
+                (n.qv != null ? (Long.toHexString(n.qv.getVersion())) : "0"));
     }
 
 
@@ -709,8 +724,6 @@ public class FastLeaderElection implements Election {
      * Check if a pair (server id, zxid) succeeds our
      * current vote.
      *
-     * @param id    Server identifier
-     * @param zxid  Last zxid observed by the issuer of this vote
      */
     protected boolean totalOrderPredicate(long newId, long newZxid, long newEpoch, long curId, long curZxid, long curEpoch) {
         LOG.debug("id: " + newId + ", proposed id: " + curId + ", zxid: 0x" +
@@ -742,7 +755,7 @@ public class FastLeaderElection implements Election {
      *            Identifier of the vote received last
      * @return the SyncedLearnerTracker with vote details
      */
-    private SyncedLearnerTracker getVoteTracker(Map<Long, Vote> votes, Vote vote) {
+    protected SyncedLearnerTracker getVoteTracker(Map<Long, Vote> votes, Vote vote) {
         SyncedLearnerTracker voteSet = new SyncedLearnerTracker();
         voteSet.addQuorumVerifier(self.getQuorumVerifier());
         if (self.getLastSeenQuorumVerifier() != null
@@ -775,7 +788,7 @@ public class FastLeaderElection implements Election {
      * @param   leader  leader id
      * @param   electionEpoch   epoch id
      */
-    private boolean checkLeader(
+    protected boolean checkLeader(
             Map<Long, Vote> votes,
             long leader,
             long electionEpoch){
@@ -906,7 +919,7 @@ public class FastLeaderElection implements Election {
 
             Map<Long, Vote> outofelection = new HashMap<Long, Vote>();
 
-            int notTimeout = finalizeWait;
+            int notTimeout = minNotificationInterval;
 
             synchronized(this){
                 logicalclock.incrementAndGet();
@@ -999,6 +1012,7 @@ public class FastLeaderElection implements Election {
                                     ", proposed election epoch=0x" + Long.toHexString(n.electionEpoch));
                         }
 
+                        // don't care about the version if it's in LOOKING state
                         recvset.put(n.sid, new Vote(n.leader, n.zxid, n.electionEpoch, n.peerEpoch));
 
                         voteSet = getVoteTracker(
@@ -1023,9 +1037,9 @@ public class FastLeaderElection implements Election {
                              */
                             if (n == null) {
                                 setPeerState(proposedLeader, voteSet);
-
                                 Vote endVote = new Vote(proposedLeader,
-                                        proposedZxid, proposedEpoch);
+                                        proposedZxid, logicalclock.get(), 
+                                        proposedEpoch);
                                 leaveInstance(endVote);
                                 return endVote;
                             }
@@ -1042,14 +1056,13 @@ public class FastLeaderElection implements Election {
                          */
                         if(n.electionEpoch == logicalclock.get()){
                             recvset.put(n.sid, new Vote(n.leader, n.zxid, n.electionEpoch, n.peerEpoch));
-                            voteSet = getVoteTracker(
-                                    recvset, new Vote(n.leader, n.zxid,
-                                    n.electionEpoch, n.peerEpoch, n.state));
-                            if(voteSet.hasAllQuorums()
-                                            && checkLeader(outofelection, n.leader, n.electionEpoch)) {
+                            voteSet = getVoteTracker(recvset, new Vote(n.version, 
+                                      n.leader, n.zxid, n.electionEpoch, n.peerEpoch, n.state));
+                            if (voteSet.hasAllQuorums() && 
+                                    checkLeader(outofelection, n.leader, n.electionEpoch)) {
                                 setPeerState(n.leader, voteSet);
-
-                                Vote endVote = new Vote(n.leader, n.zxid, n.peerEpoch);
+                                Vote endVote = new Vote(n.leader, 
+                                        n.zxid, n.electionEpoch, n.peerEpoch);
                                 leaveInstance(endVote);
                                 return endVote;
                             }
@@ -1058,29 +1071,20 @@ public class FastLeaderElection implements Election {
                         /*
                          * Before joining an established ensemble, verify that
                          * a majority are following the same leader.
-                         * Only peer epoch is used to check that the votes come
-                         * from the same ensemble. This is because there is at
-                         * least one corner case in which the ensemble can be
-                         * created with inconsistent zxid and election epoch
-                         * info. However, given that only one ensemble can be
-                         * running at a single point in time and that each
-                         * epoch is used only once, using only the epoch to
-                         * compare the votes is sufficient.
-                         *
-                         * @see https://issues.apache.org/jira/browse/ZOOKEEPER-1732
                          */
-                        outofelection.put(n.sid, new Vote(n.leader,
-                                IGNOREVALUE, IGNOREVALUE, n.peerEpoch, n.state));
-                        voteSet = getVoteTracker(
-                                outofelection, new Vote(n.leader,
-                                IGNOREVALUE, IGNOREVALUE, n.peerEpoch, n.state));
-                        if (voteSet.hasAllQuorums()
-                                && checkLeader(outofelection, n.leader, IGNOREVALUE)) {
+                        outofelection.put(n.sid, new Vote(n.version, n.leader,
+                                n.zxid, n.electionEpoch, n.peerEpoch, n.state));
+                        voteSet = getVoteTracker(outofelection, new Vote(n.version, 
+                                n.leader, n.zxid, n.electionEpoch, n.peerEpoch, n.state));
+
+                        if (voteSet.hasAllQuorums() &&
+                                checkLeader(outofelection, n.leader, n.electionEpoch)) {
                             synchronized(this){
                                 logicalclock.set(n.electionEpoch);
                                 setPeerState(n.leader, voteSet);
                             }
-                            Vote endVote = new Vote(n.leader, n.zxid, n.peerEpoch);
+                            Vote endVote = new Vote(n.leader, n.zxid, 
+                                    n.electionEpoch, n.peerEpoch);
                             leaveInstance(endVote);
                             return endVote;
                         }

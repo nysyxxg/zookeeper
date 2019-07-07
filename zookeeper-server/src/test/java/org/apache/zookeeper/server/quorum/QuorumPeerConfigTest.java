@@ -18,10 +18,6 @@
 
 package org.apache.zookeeper.server.quorum;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.fail;
-
 import java.io.File;
 import java.io.IOException;
 import java.net.InetSocketAddress;
@@ -31,6 +27,8 @@ import org.apache.zookeeper.common.ClientX509Util;
 import org.apache.zookeeper.server.quorum.QuorumPeerConfig.ConfigException;
 import org.apache.zookeeper.server.quorum.QuorumPeer.QuorumServer;
 import org.junit.Test;
+
+import static org.junit.Assert.*;
 
 public class QuorumPeerConfigTest {
 
@@ -91,17 +89,18 @@ public class QuorumPeerConfigTest {
      * https://issues.apache.org/jira/browse/ZOOKEEPER-2297
      */
     @Test
-    public void testCustomSSLAuth()
-            throws IOException{
-        System.setProperty(new ClientX509Util().getSslAuthProviderProperty(), "y509");
-        QuorumPeerConfig quorumPeerConfig = new QuorumPeerConfig();
-        try {
-            Properties zkProp = getDefaultZKProperties();
-            zkProp.setProperty("secureClientPort", "12345");
-            quorumPeerConfig.parseProperties(zkProp);
-            fail("ConfigException is expected");
-        } catch (ConfigException e) {
-            assertNotNull(e.getMessage());
+    public void testCustomSSLAuth() throws IOException {
+        try (ClientX509Util x509Util = new ClientX509Util()) {
+            System.setProperty(x509Util.getSslAuthProviderProperty(), "y509");
+            QuorumPeerConfig quorumPeerConfig = new QuorumPeerConfig();
+            try {
+                Properties zkProp = getDefaultZKProperties();
+                zkProp.setProperty("secureClientPort", "12345");
+                quorumPeerConfig.parseProperties(zkProp);
+                fail("ConfigException is expected");
+            } catch (ConfigException e) {
+                assertNotNull(e.getMessage());
+            }
         }
     }
 
@@ -145,6 +144,28 @@ public class QuorumPeerConfigTest {
             new InetSocketAddress("0.0.0.0", clientPort);
         assertEquals(expectedAddress, quorumPeerConfig.getClientPortAddress());
         assertEquals(quorumPeerConfig.getClientPortAddress(), qs.clientAddr);
+    }
+
+    @Test
+    public void testJvmPauseMonitorConfigured()
+            throws IOException, ConfigException {
+        final Long sleepTime = 444L;
+        final Long warnTH = 5555L;
+        final Long infoTH = 555L;
+
+        QuorumPeerConfig quorumPeerConfig = new QuorumPeerConfig();
+        Properties zkProp = getDefaultZKProperties();
+        zkProp.setProperty("dataDir", new File("myDataDir").getAbsolutePath());
+        zkProp.setProperty("jvm.pause.monitor", "true");
+        zkProp.setProperty("jvm.pause.sleep.time.ms", sleepTime.toString());
+        zkProp.setProperty("jvm.pause.warn-threshold.ms", warnTH.toString());
+        zkProp.setProperty("jvm.pause.info-threshold.ms", infoTH.toString());
+        quorumPeerConfig.parseProperties(zkProp);
+
+        assertEquals(sleepTime, Long.valueOf(quorumPeerConfig.getJvmPauseSleepTimeMs()));
+        assertEquals(warnTH, Long.valueOf(quorumPeerConfig.getJvmPauseWarnThresholdMs()));
+        assertEquals(infoTH, Long.valueOf(quorumPeerConfig.getJvmPauseInfoThresholdMs()));
+        assertTrue(quorumPeerConfig.isJvmPauseMonitorToRun());
     }
 
     private Properties getDefaultZKProperties() {

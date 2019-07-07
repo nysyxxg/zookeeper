@@ -16,14 +16,17 @@
  */
 package org.apache.zookeeper.cli;
 
-import java.io.IOException;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+
 import org.apache.commons.cli.CommandLine;
 import org.apache.commons.cli.Options;
 import org.apache.commons.cli.ParseException;
 import org.apache.commons.cli.Parser;
 import org.apache.commons.cli.PosixParser;
 import org.apache.zookeeper.AsyncCallback;
-import org.apache.zookeeper.KeeperException;
 
 /**
  * sync command for cli
@@ -32,6 +35,7 @@ public class SyncCommand extends CliCommand {
 
     private static Options options = new Options();
     private String[] args;
+    public static final long SYNC_TIMEOUT = TimeUnit.SECONDS.toMillis(30L);
 
     public SyncCommand() {
         super("sync", "path");
@@ -57,17 +61,29 @@ public class SyncCommand extends CliCommand {
     @Override
     public boolean exec() throws CliException {
         String path = args[1];
+        CompletableFuture<Integer> cf = new CompletableFuture<>();
+
         try {
             zk.sync(path, new AsyncCallback.VoidCallback() {
-
                 public void processResult(int rc, String path, Object ctx) {
-                    out.println("Sync returned " + rc);
+                    cf.complete(rc);
                 }
             }, null);
+
+            int resultCode = cf.get(SYNC_TIMEOUT, TimeUnit.MILLISECONDS);
+            if(resultCode == 0) {
+                out.println("Sync is OK");
+            } else {
+                out.println("Sync has failed. rc=" + resultCode);
+            }
         } catch (IllegalArgumentException ex) {
             throw new MalformedPathException(ex.getMessage());
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            throw new CliWrapperException(ie);
+        } catch (TimeoutException | ExecutionException ex) {
+            throw new CliWrapperException(ex);
         }
-
 
         return false;
     }

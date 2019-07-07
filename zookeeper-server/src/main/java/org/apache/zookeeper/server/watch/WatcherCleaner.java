@@ -25,6 +25,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.zookeeper.common.Time;
 import org.apache.zookeeper.server.RateLogger;
+import org.apache.zookeeper.server.ServerMetrics;
 import org.apache.zookeeper.server.WorkerService;
 import org.apache.zookeeper.server.WorkerService.WorkRequest;
 
@@ -50,6 +51,7 @@ public class WatcherCleaner extends Thread {
 
     private volatile boolean stopped = false;
     private final Object cleanEvent = new Object();
+    private final Object processingCompletedEvent = new Object();
     private final Random r = new Random(System.nanoTime());
     private final WorkerService cleaners;
 
@@ -102,17 +104,22 @@ public class WatcherCleaner extends Thread {
                 totalDeadWatchers.get() >= maxInProcessingDeadWatchers) {
             try {
                 RATE_LOGGER.rateLimitLog("Waiting for dead watchers cleaning");
-                synchronized(totalDeadWatchers) {
-                    totalDeadWatchers.wait(100);
+                long startTime = Time.currentElapsedTime();
+                synchronized(processingCompletedEvent) {
+                    processingCompletedEvent.wait(100);
                 }
+                long latency = Time.currentElapsedTime() - startTime;
+                ServerMetrics.getMetrics().ADD_DEAD_WATCHER_STALL_TIME.add(latency);
             } catch (InterruptedException e) {
                 LOG.info("Got interrupted while waiting for dead watches " +
                         "queue size");
+                break;
             }
         }
         synchronized (this) {
             if (deadWatchers.add(watcherBit)) {
                 totalDeadWatchers.incrementAndGet();
+                ServerMetrics.getMetrics().DEAD_WATCHERS_QUEUED.add(1);
                 if (deadWatchers.size() >= watcherCleanThreshold) {
                     synchronized (cleanEvent) {
                         cleanEvent.notifyAll();
@@ -129,7 +136,7 @@ public class WatcherCleaner extends Thread {
                 try {
                     // add some jitter to avoid cleaning dead watchers at the
                     // same time in the quorum
-                    if (deadWatchers.size() < watcherCleanThreshold) {
+                    if (!stopped && deadWatchers.size() < watcherCleanThreshold) {
                         int maxWaitMs = (watcherCleanIntervalInSeconds +
                             r.nextInt(watcherCleanIntervalInSeconds / 2 + 1)) * 1000;
                         cleanEvent.wait(maxWaitMs);
@@ -162,9 +169,11 @@ public class WatcherCleaner extends Thread {
                         listener.processDeadWatchers(snapshot);
                         long latency = Time.currentElapsedTime() - startTime;
                         LOG.info("Takes {} to process {} watches", latency, total);
+                        ServerMetrics.getMetrics().DEAD_WATCHERS_CLEANER_LATENCY.add(latency);
+                        ServerMetrics.getMetrics().DEAD_WATCHERS_CLEARED.add(total);
                         totalDeadWatchers.addAndGet(-total);
-                        synchronized(totalDeadWatchers) {
-                            totalDeadWatchers.notifyAll();
+                        synchronized(processingCompletedEvent) {
+                            processingCompletedEvent.notifyAll();
                         }
                     }
                 });
@@ -177,6 +186,10 @@ public class WatcherCleaner extends Thread {
         stopped = true;
         deadWatchers.clear();
         cleaners.stop();
+        this.interrupt();
+        if (LOG.isInfoEnabled()) {
+            LOG.info("WatcherCleaner thread shutdown is initiated");
+        }
     }
 
 }

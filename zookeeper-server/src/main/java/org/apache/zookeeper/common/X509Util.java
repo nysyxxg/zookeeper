@@ -17,9 +17,14 @@
  */
 package org.apache.zookeeper.common;
 
-
+import java.io.Closeable;
 import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
 import java.net.Socket;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardWatchEventKinds;
+import java.nio.file.WatchEvent;
 import java.security.GeneralSecurityException;
 import java.security.KeyManagementException;
 import java.security.KeyStore;
@@ -27,14 +32,14 @@ import java.security.NoSuchAlgorithmException;
 import java.security.Security;
 import java.security.cert.PKIXBuilderParameters;
 import java.security.cert.X509CertSelector;
-import java.util.Arrays;
+import java.util.Objects;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 
 import javax.net.ssl.CertPathTrustManagerParameters;
 import javax.net.ssl.KeyManager;
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
-import javax.net.ssl.SSLParameters;
 import javax.net.ssl.SSLServerSocket;
 import javax.net.ssl.SSLSocket;
 import javax.net.ssl.TrustManager;
@@ -57,24 +62,104 @@ import org.slf4j.LoggerFactory;
  *   Performance testing done by Facebook engineers shows that on Intel x86_64 machines, Java9 performs better with
  *   GCM and Java8 performs better with CBC, so these seem like reasonable defaults.
  */
-public abstract class X509Util {
+public abstract class X509Util implements Closeable, AutoCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(X509Util.class);
 
-    static final String DEFAULT_PROTOCOL = "TLSv1.2";
-    private static final String[] DEFAULT_CIPHERS_JAVA8 = {
-            "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
-            "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
-            "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
-            "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256"
-    };
-    private static final String[] DEFAULT_CIPHERS_JAVA9 = {
+    private static final String REJECT_CLIENT_RENEGOTIATION_PROPERTY =
+            "jdk.tls.rejectClientInitiatedRenegotiation";
+    static {
+        // Client-initiated renegotiation in TLS is unsafe and
+        // allows MITM attacks, so we should disable it unless
+        // it was explicitly enabled by the user.
+        // A brief summary of the issue can be found at
+        // https://www.ietf.org/proceedings/76/slides/tls-7.pdf
+        if (System.getProperty(REJECT_CLIENT_RENEGOTIATION_PROPERTY) == null) {
+            LOG.info("Setting -D {}=true to disable client-initiated TLS renegotiation",
+                    REJECT_CLIENT_RENEGOTIATION_PROPERTY);
+            System.setProperty(REJECT_CLIENT_RENEGOTIATION_PROPERTY, Boolean.TRUE.toString());
+        }
+    }
+
+    public static final String DEFAULT_PROTOCOL = "TLSv1.2";
+    private static String[] getGCMCiphers() {
+        return new String[] {
             "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
             "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+            "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+            "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+        };
+    }
+
+    private static String[] getCBCCiphers() {
+        return new String[] {
             "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256",
-            "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256"
-    };
+            "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256",
+            "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA",
+            "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA",
+            "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA384",
+            "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA384",
+            "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA",
+            "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA",
+        };
+    }
+
+    private static String[] concatArrays(String[] left, String[] right) {
+        String[] result = new String[left.length + right.length];
+        System.arraycopy(left, 0, result, 0, left.length);
+        System.arraycopy(right, 0, result, left.length, right.length);
+        return result;
+    }
+
+    // On Java 8, prefer CBC ciphers since AES-NI support is lacking and GCM is slower than CBC.
+    private static final String[] DEFAULT_CIPHERS_JAVA8 = concatArrays(getCBCCiphers(), getGCMCiphers());
+    // On Java 9 and later, prefer GCM ciphers due to improved AES-NI support.
+    // Note that this performance assumption might not hold true for architectures other than x86_64.
+    private static final String[] DEFAULT_CIPHERS_JAVA9 = concatArrays(getGCMCiphers(), getCBCCiphers());
+
+    public static final int DEFAULT_HANDSHAKE_DETECTION_TIMEOUT_MILLIS = 5000;
+
+    /**
+     * Enum specifying the client auth requirement of server-side TLS sockets created by this X509Util.
+     * <ul>
+     *     <li>NONE - do not request a client certificate.</li>
+     *     <li>WANT - request a client certificate, but allow anonymous clients to connect.</li>
+     *     <li>NEED - require a client certificate, disconnect anonymous clients.</li>
+     * </ul>
+     *
+     * If the config property is not set, the default value is NEED.
+     */
+    public enum ClientAuth {
+        NONE(io.netty.handler.ssl.ClientAuth.NONE),
+        WANT(io.netty.handler.ssl.ClientAuth.OPTIONAL),
+        NEED(io.netty.handler.ssl.ClientAuth.REQUIRE);
+
+        private final io.netty.handler.ssl.ClientAuth nettyAuth;
+
+        ClientAuth(io.netty.handler.ssl.ClientAuth nettyAuth) {
+            this.nettyAuth = nettyAuth;
+        }
+
+        /**
+         * Converts a property value to a ClientAuth enum. If the input string is empty or null, returns
+         * <code>ClientAuth.NEED</code>.
+         * @param prop the property string.
+         * @return the ClientAuth.
+         * @throws IllegalArgumentException if the property value is not "NONE", "WANT", "NEED", or empty/null.
+         */
+        public static ClientAuth fromPropertyValue(String prop) {
+            if (prop == null || prop.length() == 0) {
+                return NEED;
+            }
+            return ClientAuth.valueOf(prop.toUpperCase());
+        }
+
+        public io.netty.handler.ssl.ClientAuth toNettyClientAuth() {
+            return nettyAuth;
+        }
+    }
 
     private String sslProtocolProperty = getConfigPrefix() + "protocol";
+    private String sslEnabledProtocolsProperty = getConfigPrefix() + "enabledProtocols";
     private String cipherSuitesProperty = getConfigPrefix() + "ciphersuites";
     private String sslKeystoreLocationProperty = getConfigPrefix() + "keyStore.location";
     private String sslKeystorePasswdProperty = getConfigPrefix() + "keyStore.password";
@@ -82,28 +167,38 @@ public abstract class X509Util {
     private String sslTruststoreLocationProperty = getConfigPrefix() + "trustStore.location";
     private String sslTruststorePasswdProperty = getConfigPrefix() + "trustStore.password";
     private String sslTruststoreTypeProperty = getConfigPrefix() + "trustStore.type";
+    private String sslContextSupplierClassProperty = getConfigPrefix() + "context.supplier.class";
     private String sslHostnameVerificationEnabledProperty = getConfigPrefix() + "hostnameVerification";
     private String sslCrlEnabledProperty = getConfigPrefix() + "crl";
     private String sslOcspEnabledProperty = getConfigPrefix() + "ocsp";
+    private String sslClientAuthProperty = getConfigPrefix() + "clientAuth";
+    private String sslHandshakeDetectionTimeoutMillisProperty = getConfigPrefix() + "handshakeDetectionTimeoutMillis";
 
-    private String[] cipherSuites;
+    private ZKConfig zkConfig;
+    private AtomicReference<SSLContextAndOptions> defaultSSLContextAndOptions = new AtomicReference<>(null);
 
-    private AtomicReference<SSLContext> defaultSSLContext = new AtomicReference<>(null);
+    private FileChangeWatcher keyStoreFileWatcher;
+    private FileChangeWatcher trustStoreFileWatcher;
 
     public X509Util() {
-        String cipherSuitesInput = System.getProperty(cipherSuitesProperty);
-        if (cipherSuitesInput == null) {
-            cipherSuites = getDefaultCipherSuites();
-        } else {
-            cipherSuites = cipherSuitesInput.split(",");
-        }
+        this(null);
+    }
+
+    public X509Util(ZKConfig zkConfig) {
+        this.zkConfig = zkConfig;
+        keyStoreFileWatcher = trustStoreFileWatcher = null;
     }
 
     protected abstract String getConfigPrefix();
+
     protected abstract boolean shouldVerifyClientHostname();
 
     public String getSslProtocolProperty() {
         return sslProtocolProperty;
+    }
+
+    public String getSslEnabledProtocolsProperty() {
+        return sslEnabledProtocolsProperty;
     }
 
     public String getCipherSuitesProperty() {
@@ -112,6 +207,10 @@ public abstract class X509Util {
 
     public String getSslKeystoreLocationProperty() {
         return sslKeystoreLocationProperty;
+    }
+
+    public String getSslCipherSuitesProperty() {
+        return cipherSuitesProperty;
     }
 
     public String getSslKeystorePasswdProperty() {
@@ -134,6 +233,10 @@ public abstract class X509Util {
         return sslTruststoreTypeProperty;
     }
 
+    public String getSslContextSupplierClassProperty() {
+        return sslContextSupplierClassProperty;
+    }
+
     public String getSslHostnameVerificationEnabledProperty() {
         return sslHostnameVerificationEnabledProperty;
     }
@@ -146,29 +249,96 @@ public abstract class X509Util {
         return sslOcspEnabledProperty;
     }
 
+    public String getSslClientAuthProperty() {
+        return sslClientAuthProperty;
+    }
+
+    /**
+     * Returns the config property key that controls the amount of time, in milliseconds, that the first
+     * UnifiedServerSocket read operation will block for when trying to detect the client mode (TLS or PLAINTEXT).
+     *
+     * @return the config property key.
+     */
+    public String getSslHandshakeDetectionTimeoutMillisProperty() {
+        return sslHandshakeDetectionTimeoutMillisProperty;
+    }
+
     public SSLContext getDefaultSSLContext() throws X509Exception.SSLContextException {
-        SSLContext result = defaultSSLContext.get();
+        return getDefaultSSLContextAndOptions().getSSLContext();
+    }
+
+    public SSLContext createSSLContext(ZKConfig config) throws SSLContextException {
+        return createSSLContextAndOptions(config).getSSLContext();
+    }
+
+    public SSLContextAndOptions getDefaultSSLContextAndOptions() throws X509Exception.SSLContextException {
+        SSLContextAndOptions result = defaultSSLContextAndOptions.get();
         if (result == null) {
-            result = createSSLContext();
-            if (!defaultSSLContext.compareAndSet(null, result)) {
+            result = createSSLContextAndOptions();
+            if (!defaultSSLContextAndOptions.compareAndSet(null, result)) {
                 // lost the race, another thread already set the value
-                result = defaultSSLContext.get();
+                result = defaultSSLContextAndOptions.get();
             }
         }
         return result;
     }
 
-    private SSLContext createSSLContext() throws SSLContextException {
+    private void resetDefaultSSLContextAndOptions() throws X509Exception.SSLContextException {
+        SSLContextAndOptions newContext = createSSLContextAndOptions();
+        defaultSSLContextAndOptions.set(newContext);
+    }
+
+    private SSLContextAndOptions createSSLContextAndOptions() throws SSLContextException {
         /*
          * Since Configuration initializes the key store and trust store related
          * configuration from system property. Reading property from
          * configuration will be same reading from system property
          */
-        ZKConfig config=new ZKConfig();
-        return createSSLContext(config);
+        return createSSLContextAndOptions(zkConfig == null ? new ZKConfig() : zkConfig);
     }
 
-    public SSLContext createSSLContext(ZKConfig config) throws SSLContextException {
+    /**
+     * Returns the max amount of time, in milliseconds, that the first UnifiedServerSocket read() operation should
+     * block for when trying to detect the client mode (TLS or PLAINTEXT).
+     * Defaults to {@link X509Util#DEFAULT_HANDSHAKE_DETECTION_TIMEOUT_MILLIS}.
+     *
+     * @return the handshake detection timeout, in milliseconds.
+     */
+    public int getSslHandshakeTimeoutMillis() {
+        try {
+            SSLContextAndOptions ctx = getDefaultSSLContextAndOptions();
+            return ctx.getHandshakeDetectionTimeoutMillis();
+        } catch (SSLContextException e) {
+            LOG.error("Error creating SSL context and options", e);
+            return DEFAULT_HANDSHAKE_DETECTION_TIMEOUT_MILLIS;
+        } catch (Exception e) {
+            LOG.error("Error parsing config property " + getSslHandshakeDetectionTimeoutMillisProperty(), e);
+            return DEFAULT_HANDSHAKE_DETECTION_TIMEOUT_MILLIS;
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    public SSLContextAndOptions createSSLContextAndOptions(ZKConfig config) throws SSLContextException {
+        final String supplierContextClassName = config.getProperty(sslContextSupplierClassProperty);
+        if (supplierContextClassName != null) {
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("Loading SSLContext supplier from property '{}'", sslContextSupplierClassProperty);
+            }
+            try {
+                Class<?> sslContextClass = Class.forName(supplierContextClassName);
+                Supplier<SSLContext> sslContextSupplier = (Supplier<SSLContext>) sslContextClass.getConstructor().newInstance();
+                return new SSLContextAndOptions(this, config, sslContextSupplier.get());
+            } catch (ClassNotFoundException | ClassCastException | NoSuchMethodException | InvocationTargetException |
+                    InstantiationException | IllegalAccessException e) {
+                throw new SSLContextException("Could not retrieve the SSLContext from supplier source '" + supplierContextClassName +
+                        "' provided in the property '" + sslContextSupplierClassProperty + "'", e);
+            }
+        } else {
+            return createSSLContextAndOptionsFromConfig(config);
+        }
+    }
+
+    public SSLContextAndOptions createSSLContextAndOptionsFromConfig(ZKConfig config) throws SSLContextException {
         KeyManager[] keyManagers = null;
         TrustManager[] trustManagers = null;
 
@@ -218,12 +388,12 @@ public abstract class X509Util {
             }
         }
 
-        String protocol = System.getProperty(sslProtocolProperty, DEFAULT_PROTOCOL);
+        String protocol = config.getProperty(sslProtocolProperty, DEFAULT_PROTOCOL);
         try {
             SSLContext sslContext = SSLContext.getInstance(protocol);
             sslContext.init(keyManagers, trustManagers, null);
-            return sslContext;
-        } catch (NoSuchAlgorithmException|KeyManagementException sslContextInitException) {
+            return new SSLContextAndOptions(this, config, sslContext);
+        } catch (NoSuchAlgorithmException | KeyManagementException sslContextInitException) {
             throw new SSLContextException(sslContextInitException);
         }
     }
@@ -348,55 +518,140 @@ public abstract class X509Util {
     }
 
     public SSLSocket createSSLSocket() throws X509Exception, IOException {
-        SSLSocket sslSocket = (SSLSocket) getDefaultSSLContext().getSocketFactory().createSocket();
-        configureSSLSocket(sslSocket);
-
-        return sslSocket;
+        return getDefaultSSLContextAndOptions().createSSLSocket();
     }
 
-    public SSLSocket createSSLSocket(Socket socket) throws X509Exception, IOException {
-        SSLSocket sslSocket = (SSLSocket) getDefaultSSLContext().getSocketFactory().createSocket(socket, null, socket.getPort(), true);
-        configureSSLSocket(sslSocket);
-
-        return sslSocket;
-    }
-
-    private void configureSSLSocket(SSLSocket sslSocket) {
-        SSLParameters sslParameters = sslSocket.getSSLParameters();
-        LOG.debug("Setup cipher suites for client socket: {}", Arrays.toString(cipherSuites));
-        sslParameters.setCipherSuites(cipherSuites);
-        sslSocket.setSSLParameters(sslParameters);
+    public SSLSocket createSSLSocket(Socket socket, byte[] pushbackBytes) throws X509Exception, IOException {
+        return getDefaultSSLContextAndOptions().createSSLSocket(socket, pushbackBytes);
     }
 
     public SSLServerSocket createSSLServerSocket() throws X509Exception, IOException {
-        SSLServerSocket sslServerSocket = (SSLServerSocket) getDefaultSSLContext().getServerSocketFactory().createServerSocket();
-        configureSSLServerSocket(sslServerSocket);
-
-        return sslServerSocket;
+        return getDefaultSSLContextAndOptions().createSSLServerSocket();
     }
 
     public SSLServerSocket createSSLServerSocket(int port) throws X509Exception, IOException {
-        SSLServerSocket sslServerSocket = (SSLServerSocket) getDefaultSSLContext().getServerSocketFactory().createServerSocket(port);
-        configureSSLServerSocket(sslServerSocket);
-
-        return sslServerSocket;
+        return getDefaultSSLContextAndOptions().createSSLServerSocket(port);
     }
 
-    private void configureSSLServerSocket(SSLServerSocket sslServerSocket) {
-        SSLParameters sslParameters = sslServerSocket.getSSLParameters();
-        sslParameters.setNeedClientAuth(true);
-        LOG.debug("Setup cipher suites for server socket: {}", Arrays.toString(cipherSuites));
-        sslParameters.setCipherSuites(cipherSuites);
-        sslServerSocket.setSSLParameters(sslParameters);
+    static String[] getDefaultCipherSuites() {
+        return getDefaultCipherSuitesForJavaVersion(System.getProperty("java.specification.version"));
     }
 
-    private String[] getDefaultCipherSuites() {
-        String javaVersion = System.getProperty("java.specification.version");
-        if ("9".equals(javaVersion)) {
-            LOG.debug("Using Java9-optimized cipher suites for Java version {}", javaVersion);
+    static String[] getDefaultCipherSuitesForJavaVersion(String javaVersion) {
+        Objects.requireNonNull(javaVersion);
+        if (javaVersion.matches("\\d+")) {
+            // Must be Java 9 or later
+            LOG.debug("Using Java9+ optimized cipher suites for Java version {}", javaVersion);
             return DEFAULT_CIPHERS_JAVA9;
+        } else if (javaVersion.startsWith("1.")) {
+            // Must be Java 1.8 or earlier
+            LOG.debug("Using Java8 optimized cipher suites for Java version {}", javaVersion);
+            return DEFAULT_CIPHERS_JAVA8;
+        } else {
+            LOG.debug("Could not parse java version {}, using Java8 optimized cipher suites",
+                    javaVersion);
+            return DEFAULT_CIPHERS_JAVA8;
         }
-        LOG.debug("Using Java8-optimized cipher suites for Java version {}", javaVersion);
-        return DEFAULT_CIPHERS_JAVA8;
+    }
+
+    private FileChangeWatcher newFileChangeWatcher(String fileLocation) throws IOException {
+        if (fileLocation == null || fileLocation.isEmpty()) {
+            return null;
+        }
+        final Path filePath = Paths.get(fileLocation).toAbsolutePath();
+        Path parentPath = filePath.getParent();
+        if (parentPath == null) {
+            throw new IOException(
+                    "Key/trust store path does not have a parent: " + filePath);
+        }
+        return new FileChangeWatcher(
+                parentPath,
+                watchEvent -> {
+                    handleWatchEvent(filePath, watchEvent);
+                });
+    }
+
+    /**
+     * Enables automatic reloading of the trust store and key store files when they change on disk.
+     *
+     * @throws IOException if creating the FileChangeWatcher objects fails.
+     */
+    public void enableCertFileReloading() throws IOException {
+        LOG.info("enabling cert file reloading");
+        ZKConfig config = zkConfig == null ? new ZKConfig() : zkConfig;
+        FileChangeWatcher newKeyStoreFileWatcher =
+                newFileChangeWatcher(config.getProperty(sslKeystoreLocationProperty));
+        if (newKeyStoreFileWatcher != null) {
+            // stop old watcher if there is one
+            if (keyStoreFileWatcher != null) {
+                keyStoreFileWatcher.stop();
+            }
+            keyStoreFileWatcher = newKeyStoreFileWatcher;
+            keyStoreFileWatcher.start();
+        }
+        FileChangeWatcher newTrustStoreFileWatcher =
+                newFileChangeWatcher(config.getProperty(sslTruststoreLocationProperty));
+        if (newTrustStoreFileWatcher != null) {
+            // stop old watcher if there is one
+            if (trustStoreFileWatcher != null) {
+                trustStoreFileWatcher.stop();
+            }
+            trustStoreFileWatcher = newTrustStoreFileWatcher;
+            trustStoreFileWatcher.start();
+        }
+    }
+
+    /**
+     * Disables automatic reloading of the trust store and key store files when they change on disk.
+     * Stops background threads and closes WatchService instances.
+     */
+    @Override
+    public void close() {
+        if (keyStoreFileWatcher != null) {
+            keyStoreFileWatcher.stop();
+            keyStoreFileWatcher = null;
+        }
+        if (trustStoreFileWatcher != null) {
+            trustStoreFileWatcher.stop();
+            trustStoreFileWatcher = null;
+        }
+    }
+
+    /**
+     * Handler for watch events that let us know a file we may care about has changed on disk.
+     *
+     * @param filePath the path to the file we are watching for changes.
+     * @param event    the WatchEvent.
+     */
+    private void handleWatchEvent(Path filePath, WatchEvent<?> event) {
+        boolean shouldResetContext = false;
+        Path dirPath = filePath.getParent();
+        if (event.kind().equals(StandardWatchEventKinds.OVERFLOW)) {
+            // If we get notified about possibly missed events, reload the key store / trust store just to be sure.
+            shouldResetContext = true;
+        } else if (event.kind().equals(StandardWatchEventKinds.ENTRY_MODIFY) ||
+                event.kind().equals(StandardWatchEventKinds.ENTRY_CREATE)) {
+            Path eventFilePath = dirPath.resolve((Path) event.context());
+            if (filePath.equals(eventFilePath)) {
+                shouldResetContext = true;
+            }
+        }
+        // Note: we don't care about delete events
+        if (shouldResetContext) {
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("Attempting to reset default SSL context after receiving watch event: " +
+                        event.kind() + " with context: " + event.context());
+            }
+            try {
+                this.resetDefaultSSLContextAndOptions();
+            } catch (SSLContextException e) {
+                throw new RuntimeException(e);
+            }
+        } else {
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("Ignoring watch event and keeping previous default SSL context. Event kind: " +
+                        event.kind() + " with context: " + event.context());
+            }
+        }
     }
 }

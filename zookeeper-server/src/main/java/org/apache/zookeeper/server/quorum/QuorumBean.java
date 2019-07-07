@@ -45,6 +45,22 @@ public class QuorumBean implements QuorumMXBean, ZKMBeanInfo {
         return peer.getQuorumSize();
     }
 
+    public int getSyncLimit() {
+        return peer.getSyncLimit();
+    }
+
+    public int getInitLimit() {
+        return peer.getInitLimit();
+    }
+
+    public void setInitLimit(int initLimit) {
+        peer.setInitLimit(initLimit);
+    }
+
+    public void setSyncLimit(int syncLimit) {
+        peer.setSyncLimit(syncLimit);
+    }
+
     @Override
     public boolean isSslQuorum() {
         return peer.isSslQuorum();
@@ -53,5 +69,15 @@ public class QuorumBean implements QuorumMXBean, ZKMBeanInfo {
     @Override
     public boolean isPortUnification() {
         return peer.shouldUsePortUnification();
+    }
+
+    @Override
+    public long getObserverElectionDelayMS() {
+        return Observer.getObserverElectionDelayMs();
+    }
+
+    @Override
+    public void setObserverElectionDelayMS(long delayMS) {
+        Observer.setObserverElectionDelayMs(delayMS);
     }
 }
