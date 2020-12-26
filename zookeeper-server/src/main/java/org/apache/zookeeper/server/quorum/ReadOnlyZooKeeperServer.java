@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -18,13 +18,18 @@
 
 package org.apache.zookeeper.server.quorum;
 
+import java.io.IOException;
 import java.io.PrintWriter;
-
+import java.util.Objects;
+import java.util.stream.Collectors;
+import org.apache.zookeeper.ZooDefs.OpCode;
 import org.apache.zookeeper.jmx.MBeanRegistry;
 import org.apache.zookeeper.server.DataTreeBean;
 import org.apache.zookeeper.server.FinalRequestProcessor;
 import org.apache.zookeeper.server.PrepRequestProcessor;
+import org.apache.zookeeper.server.Request;
 import org.apache.zookeeper.server.RequestProcessor;
+import org.apache.zookeeper.server.ServerCnxn;
 import org.apache.zookeeper.server.ZKDatabase;
 import org.apache.zookeeper.server.ZooKeeperServer;
 import org.apache.zookeeper.server.ZooKeeperServerBean;
@@ -43,10 +48,16 @@ public class ReadOnlyZooKeeperServer extends ZooKeeperServer {
     protected final QuorumPeer self;
     private volatile boolean shutdown = false;
 
-    ReadOnlyZooKeeperServer(FileTxnSnapLog logFactory, QuorumPeer self,
-                            ZKDatabase zkDb) {
-        super(logFactory, self.tickTime, self.minSessionTimeout,
-              self.maxSessionTimeout, self.clientPortListenBacklog, zkDb, self.getInitialConfig());
+    ReadOnlyZooKeeperServer(FileTxnSnapLog logFactory, QuorumPeer self, ZKDatabase zkDb) {
+        super(
+            logFactory,
+            self.tickTime,
+            self.minSessionTimeout,
+            self.maxSessionTimeout,
+            self.clientPortListenBacklog,
+            zkDb,
+            self.getInitialConfig(),
+            self.isReconfigEnabled());
         this.self = self;
     }
 
@@ -71,6 +82,49 @@ public class ReadOnlyZooKeeperServer extends ZooKeeperServer {
         self.setZooKeeperServer(this);
         self.adminServer.setZooKeeperServer(this);
         LOG.info("Read-only server started");
+    }
+
+    @Override
+    public void createSessionTracker() {
+        sessionTracker = new LearnerSessionTracker(
+                this, getZKDatabase().getSessionWithTimeOuts(),
+                this.tickTime, self.getId(), self.areLocalSessionsEnabled(),
+                getZooKeeperServerListener());
+    }
+
+    @Override
+    protected void startSessionTracker() {
+        ((LearnerSessionTracker) sessionTracker).start();
+    }
+
+    @Override
+    protected void setLocalSessionFlag(Request si) {
+        switch (si.type) {
+            case OpCode.createSession:
+                if (self.areLocalSessionsEnabled()) {
+                    si.setLocalSession(true);
+                }
+                break;
+            case OpCode.closeSession:
+                if (((UpgradeableSessionTracker) sessionTracker).isLocalSession(si.sessionId)) {
+                    si.setLocalSession(true);
+                } else {
+                    LOG.warn("Submitting global closeSession request for session 0x{} in ReadOnly mode",
+                            Long.toHexString(si.sessionId));
+                }
+                break;
+            default:
+                break;
+        }
+    }
+
+    @Override
+    protected void validateSession(ServerCnxn cnxn, long sessionId) throws IOException {
+        if (((LearnerSessionTracker) sessionTracker).isGlobalSession(sessionId)) {
+            String msg = "Refusing global session reconnection in RO mode " + cnxn.getRemoteSocketAddress();
+            LOG.info(msg);
+            throw new ServerCnxn.CloseRequestException(msg, ServerCnxn.DisconnectReason.RENEW_GLOBAL_SESSION_IN_RO_MODE);
+        }
     }
 
     @Override
@@ -166,9 +220,11 @@ public class ReadOnlyZooKeeperServer extends ZooKeeperServer {
         pwriter.print("electionAlg=");
         pwriter.println(self.getElectionType());
         pwriter.print("electionPort=");
-        pwriter.println(self.getElectionAddress().getPort());
+        pwriter.println(self.getElectionAddress().getAllPorts()
+                .stream().map(Objects::toString).collect(Collectors.joining("|")));
         pwriter.print("quorumPort=");
-        pwriter.println(self.getQuorumAddress().getPort());
+        pwriter.println(self.getQuorumAddress().getAllPorts()
+                .stream().map(Objects::toString).collect(Collectors.joining("|")));
         pwriter.print("peerType=");
         pwriter.println(self.getLearnerType().ordinal());
     }
@@ -177,4 +233,5 @@ public class ReadOnlyZooKeeperServer extends ZooKeeperServer {
     protected void setState(State state) {
         this.state = state;
     }
+
 }

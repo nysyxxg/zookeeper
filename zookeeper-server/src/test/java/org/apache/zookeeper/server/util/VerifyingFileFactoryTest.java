@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -18,13 +18,12 @@
 
 package org.apache.zookeeper.server.util;
 
-import static org.junit.Assert.*;
-
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import java.io.File;
-
 import org.apache.zookeeper.ZKTestCase;
-import org.junit.Before;
-import org.junit.Test;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -32,32 +31,31 @@ public class VerifyingFileFactoryTest extends ZKTestCase {
 
     private Logger log;
 
-    @Before
-    public void setUp(){
+    @BeforeEach
+    public void setUp() {
         log = LoggerFactory.getLogger("TODO: Mock Logging");
     }
 
     @Test
     public void testForWarningOnRelativePath() {
-        VerifyingFileFactory vff = new VerifyingFileFactory.Builder(log)
-            .warnForRelativePath().build();
+        VerifyingFileFactory vff = new VerifyingFileFactory.Builder(log).warnForRelativePath().build();
         vff.create("a/relative/path");
         // assertTrue(log.hasWarned);
     }
 
     @Test
     public void testForNoWarningOnIntendedRelativePath() {
-        VerifyingFileFactory vff = new VerifyingFileFactory.Builder(log)
-            .warnForRelativePath().build();
+        VerifyingFileFactory vff = new VerifyingFileFactory.Builder(log).warnForRelativePath().build();
         vff.create("./an/intended/relative/path");
         // assertFalse(log.hasWarned);
     }
 
-    @Test(expected=IllegalArgumentException.class)
+    @Test
     public void testForFailForNonExistingPath() {
-        VerifyingFileFactory vff = new VerifyingFileFactory.Builder(log)
-            .failForNonExistingPath().build();
-        vff.create("/I/H0p3/this/path/d035/n0t/ex15t");
+        assertThrows(IllegalArgumentException.class, () -> {
+            VerifyingFileFactory vff = new VerifyingFileFactory.Builder(log).failForNonExistingPath().build();
+            vff.create("/I/H0p3/this/path/d035/n0t/ex15t");
+        });
     }
 
     @Test
@@ -66,4 +64,5 @@ public class VerifyingFileFactoryTest extends ZKTestCase {
         VerifyingFileFactory vff = new VerifyingFileFactory.Builder(log).build();
         assertEquals(file, vff.create(file.getPath()));
     }
+
 }

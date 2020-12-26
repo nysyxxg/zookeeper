@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -15,27 +15,27 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package org.apache.zookeeper;
 
-import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
-
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 import java.io.IOException;
-
 import org.apache.zookeeper.client.ZKClientConfig;
-import org.apache.zookeeper.test.TestByteBufAllocator;
 import org.apache.zookeeper.common.ZKConfig;
-import org.junit.After;
-import org.junit.Before;
-import org.junit.Test;
+import org.apache.zookeeper.test.TestByteBufAllocator;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
 
 public class ClientCnxnSocketTest {
-    @Before
+
+    @BeforeEach
     public void setUp() {
         ClientCnxnSocketNetty.setTestAllocator(TestByteBufAllocator.getInstance());
     }
 
-    @After
+    @AfterEach
     public void tearDown() {
         ClientCnxnSocketNetty.clearTestAllocator();
         TestByteBufAllocator.checkForLeaks();

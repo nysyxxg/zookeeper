@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -15,34 +15,35 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package org.apache.zookeeper.test;
 
 import static org.apache.zookeeper.test.ClientBase.CONNECTION_TIMEOUT;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.fail;
-
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 import java.io.IOException;
 import java.util.UUID;
-
 import org.apache.zookeeper.CreateMode;
 import org.apache.zookeeper.PortAssignment;
 import org.apache.zookeeper.ZooDefs.Ids;
 import org.apache.zookeeper.ZooKeeper;
-import org.apache.zookeeper.server.ServerMetrics;
 import org.apache.zookeeper.server.ZKDatabase;
 import org.apache.zookeeper.server.persistence.FileTxnSnapLog;
 import org.apache.zookeeper.server.quorum.QuorumPeer;
 import org.apache.zookeeper.server.quorum.QuorumPeer.ServerState;
 import org.apache.zookeeper.server.quorum.QuorumPeerTestBase;
 import org.apache.zookeeper.test.ClientBase.CountdownWatcher;
-import org.junit.Assert;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 
 /**
  * This class tests the non-recoverable error behavior of quorum server.
  */
 public class NonRecoverableErrorTest extends QuorumPeerTestBase {
+
     private static final String NODE_PATH = "/noLeaderIssue";
 
     /**
@@ -50,60 +51,55 @@ public class NonRecoverableErrorTest extends QuorumPeerTestBase {
      * Test to verify that even after non recoverable error (error while
      * writing transaction log), ZooKeeper is still available.
      */
-    @Test(timeout = 30000)
+    @Test
+    @Timeout(value = 30)
     public void testZooKeeperServiceAvailableOnLeader() throws Exception {
         int SERVER_COUNT = 3;
-        final int clientPorts[] = new int[SERVER_COUNT];
+        final int[] clientPorts = new int[SERVER_COUNT];
         StringBuilder sb = new StringBuilder();
         String server;
 
         for (int i = 0; i < SERVER_COUNT; i++) {
             clientPorts[i] = PortAssignment.unique();
-            server = "server." + i + "=127.0.0.1:" + PortAssignment.unique()
-                    + ":" + PortAssignment.unique() + ":participant;127.0.0.1:"
-                    + clientPorts[i];
+            server = "server." + i + "=127.0.0.1:" + PortAssignment.unique() + ":" + PortAssignment.unique()
+                     + ":participant;127.0.0.1:" + clientPorts[i];
             sb.append(server + "\n");
         }
         String currentQuorumCfgSection = sb.toString();
-        MainThread mt[] = new MainThread[SERVER_COUNT];
+        MainThread[] mt = new MainThread[SERVER_COUNT];
 
         for (int i = 0; i < SERVER_COUNT; i++) {
-            mt[i] = new MainThread(i, clientPorts[i], currentQuorumCfgSection,
-                    false);
+            mt[i] = new MainThread(i, clientPorts[i], currentQuorumCfgSection, false);
             mt[i].start();
         }
 
         // ensure server started
         for (int i = 0; i < SERVER_COUNT; i++) {
-            Assert.assertTrue("waiting for server " + i + " being up",
-                    ClientBase.waitForServerUp("127.0.0.1:" + clientPorts[i],
-                            CONNECTION_TIMEOUT));
+            assertTrue(
+                    ClientBase.waitForServerUp("127.0.0.1:" + clientPorts[i], CONNECTION_TIMEOUT),
+                    "waiting for server " + i + " being up");
         }
 
         CountdownWatcher watcher = new CountdownWatcher();
-        ZooKeeper zk = new ZooKeeper("127.0.0.1:" + clientPorts[0],
-                ClientBase.CONNECTION_TIMEOUT, watcher);
+        ZooKeeper zk = new ZooKeeper("127.0.0.1:" + clientPorts[0], ClientBase.CONNECTION_TIMEOUT, watcher);
         watcher.waitForConnected(ClientBase.CONNECTION_TIMEOUT);
 
         String data = "originalData";
-        zk.create(NODE_PATH, data.getBytes(), Ids.OPEN_ACL_UNSAFE,
-                CreateMode.PERSISTENT);
+        zk.create(NODE_PATH, data.getBytes(), Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
 
         // get information of current leader
         QuorumPeer leader = getLeaderQuorumPeer(mt);
-        assertNotNull("Leader must have been elected by now", leader);
+        assertNotNull(leader, "Leader must have been elected by now");
 
         // inject problem in leader
         FileTxnSnapLog snapLog = leader.getActiveServer().getTxnLogFactory();
-        FileTxnSnapLog fileTxnSnapLogWithError = new FileTxnSnapLog(
-                snapLog.getDataDir(), snapLog.getSnapDir()) {
+        FileTxnSnapLog fileTxnSnapLogWithError = new FileTxnSnapLog(snapLog.getDataDir(), snapLog.getSnapDir()) {
             @Override
             public void commit() throws IOException {
                 throw new IOException("Input/output error");
             }
         };
-        ZKDatabase originalZKDatabase = leader.getActiveServer()
-                .getZKDatabase();
+        ZKDatabase originalZKDatabase = leader.getActiveServer().getZKDatabase();
         long leaderCurrentEpoch = leader.getCurrentEpoch();
 
         ZKDatabase newDB = new ZKDatabase(fileTxnSnapLogWithError);
@@ -111,8 +107,7 @@ public class NonRecoverableErrorTest extends QuorumPeerTestBase {
 
         try {
             // do create operation, so that injected IOException is thrown
-            zk.create(uniqueZnode(), data.getBytes(), Ids.OPEN_ACL_UNSAFE,
-                    CreateMode.PERSISTENT);
+            zk.create(uniqueZnode(), data.getBytes(), Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
             fail("IOException is expected due to error injected to transaction log commit");
         } catch (Exception e) {
             // do nothing
@@ -127,9 +122,9 @@ public class NonRecoverableErrorTest extends QuorumPeerTestBase {
         // ensure server started, give enough time, so that new leader election
         // takes place
         for (int i = 0; i < SERVER_COUNT; i++) {
-            Assert.assertTrue("waiting for server " + i + " being up",
-                    ClientBase.waitForServerUp("127.0.0.1:" + clientPorts[i],
-                            CONNECTION_TIMEOUT));
+            assertTrue(
+                    ClientBase.waitForServerUp("127.0.0.1:" + clientPorts[i], CONNECTION_TIMEOUT),
+                    "waiting for server " + i + " being up");
         }
 
         // revert back the error
@@ -137,15 +132,14 @@ public class NonRecoverableErrorTest extends QuorumPeerTestBase {
 
         // verify that now ZooKeeper service is up and running
         leader = getLeaderQuorumPeer(mt);
-        assertNotNull("New leader must have been elected by now", leader);
+        assertNotNull(leader, "New leader must have been elected by now");
 
         String uniqueNode = uniqueZnode();
         watcher.waitForConnected(ClientBase.CONNECTION_TIMEOUT);
-        String createNode = zk.create(uniqueNode, data.getBytes(),
-                Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+        String createNode = zk.create(uniqueNode, data.getBytes(), Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
         // if node is created successfully then it means that ZooKeeper service
         // is available
-        assertEquals("Failed to create znode", uniqueNode, createNode);
+        assertEquals(uniqueNode, createNode, "Failed to create znode");
         zk.close();
         // stop all severs
         for (int i = 0; i < SERVER_COUNT; i++) {
@@ -153,8 +147,7 @@ public class NonRecoverableErrorTest extends QuorumPeerTestBase {
         }
     }
 
-    private void waitForNewLeaderElection(QuorumPeer peer,
-            long leaderCurrentEpoch) throws IOException, InterruptedException {
+    private void waitForNewLeaderElection(QuorumPeer peer, long leaderCurrentEpoch) throws IOException, InterruptedException {
         LOG.info("Waiting for new LE cycle..");
         int count = 100; // giving a grace period of 10seconds
         while (count > 0) {
@@ -163,15 +156,13 @@ public class NonRecoverableErrorTest extends QuorumPeerTestBase {
             }
             count--;
         }
-        Assert.assertNotEquals("New LE cycle must have triggered",
-                leaderCurrentEpoch, peer.getCurrentEpoch());
+        assertNotEquals(leaderCurrentEpoch, peer.getCurrentEpoch(), "New LE cycle must have triggered");
     }
 
     private QuorumPeer getLeaderQuorumPeer(MainThread[] mt) {
         for (int i = mt.length - 1; i >= 0; i--) {
             QuorumPeer quorumPeer = mt[i].getQuorumPeer();
-            if (null != quorumPeer
-                    && ServerState.LEADING == quorumPeer.getPeerState()) {
+            if (null != quorumPeer && ServerState.LEADING == quorumPeer.getPeerState()) {
                 return quorumPeer;
             }
         }
@@ -183,4 +174,5 @@ public class NonRecoverableErrorTest extends QuorumPeerTestBase {
         String node = NODE_PATH + "/" + randomUUID.toString();
         return node;
     }
+
 }

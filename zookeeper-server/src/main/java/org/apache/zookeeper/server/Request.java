@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -18,9 +18,9 @@
 
 package org.apache.zookeeper.server;
 
+import static java.nio.charset.StandardCharsets.UTF_8;
 import java.nio.ByteBuffer;
 import java.util.List;
-
 import org.apache.jute.Record;
 import org.apache.zookeeper.KeeperException;
 import org.apache.zookeeper.ZooDefs.OpCode;
@@ -28,7 +28,10 @@ import org.apache.zookeeper.common.Time;
 import org.apache.zookeeper.data.Id;
 import org.apache.zookeeper.metrics.Summary;
 import org.apache.zookeeper.metrics.SummarySet;
+import org.apache.zookeeper.server.quorum.LearnerHandler;
 import org.apache.zookeeper.server.quorum.flexible.QuorumVerifier;
+import org.apache.zookeeper.server.util.AuthUtil;
+import org.apache.zookeeper.txn.TxnDigest;
 import org.apache.zookeeper.txn.TxnHeader;
 
 /**
@@ -37,7 +40,16 @@ import org.apache.zookeeper.txn.TxnHeader;
  * onto the request as it is processed.
  */
 public class Request {
-    public final static Request requestOfDeath = new Request(null, 0, 0, 0, null, null);
+
+    public static final Request requestOfDeath = new Request(null, 0, 0, 0, null, null);
+
+    // Considers a request stale if the request's connection has closed. Enabled
+    // by default.
+    private static volatile boolean staleConnectionCheck = Boolean.parseBoolean(System.getProperty("zookeeper.request_stale_connection_check", "true"));
+
+    // Considers a request stale if the request latency is higher than its
+    // associated session timeout. Disabled by default.
+    private static volatile boolean staleLatencyCheck = Boolean.parseBoolean(System.getProperty("zookeeper.request_stale_latency_check", "false"));
 
     public Request(ServerCnxn cnxn, long sessionId, int xid, int type, ByteBuffer bb, List<Id> authInfo) {
         this.cnxn = cnxn;
@@ -80,7 +92,7 @@ public class Request {
 
     public final long createTime = Time.currentElapsedTime();
 
-    public long prepQueueStartTime= -1;
+    public long prepQueueStartTime = -1;
 
     public long prepStartTime = -1;
 
@@ -90,16 +102,38 @@ public class Request {
 
     public long syncQueueStartTime;
 
+    public long requestThrottleQueueTime;
+
     private Object owner;
 
     private KeeperException e;
 
     public QuorumVerifier qv = null;
-    
+
+    private TxnDigest txnDigest;
+
+    private boolean isThrottledFlag = false;
+
+    public boolean isThrottled() {
+      return isThrottledFlag;
+    }
+
+    public void setIsThrottled(boolean val) {
+      isThrottledFlag = val;
+    }
+
+    public boolean isThrottlable() {
+        return this.type != OpCode.ping
+                && this.type != OpCode.closeSession
+                && this.type != OpCode.createSession;
+    }
+
     /**
      * If this is a create or close request for a local-only session.
      */
     private boolean isLocalSession = false;
+
+    private int largeRequestSize = -1;
 
     public boolean isLocalSession() {
         return isLocalSession;
@@ -107,6 +141,14 @@ public class Request {
 
     public void setLocalSession(boolean isLocalSession) {
         this.isLocalSession = isLocalSession;
+    }
+
+    public void setLargeRequestSize(int size) {
+        largeRequestSize = size;
+    }
+
+    public int getLargeRequestSize() {
+        return largeRequestSize;
     }
 
     public Object getOwner() {
@@ -131,6 +173,63 @@ public class Request {
 
     public void setTxn(Record txn) {
         this.txn = txn;
+    }
+
+    public ServerCnxn getConnection() {
+        return cnxn;
+    }
+
+    public static boolean getStaleLatencyCheck() {
+        return staleLatencyCheck;
+    }
+
+    public static void setStaleLatencyCheck(boolean check) {
+        staleLatencyCheck = check;
+    }
+
+    public static boolean getStaleConnectionCheck() {
+        return staleConnectionCheck;
+    }
+
+    public static void setStaleConnectionCheck(boolean check) {
+        staleConnectionCheck = check;
+    }
+
+    public boolean isStale() {
+        if (cnxn == null) {
+            return false;
+        }
+
+        // closeSession requests should be able to outlive the session in order
+        // to clean-up state.
+        if (type == OpCode.closeSession) {
+            return false;
+        }
+
+        if (staleConnectionCheck) {
+            // If the connection is closed, consider the request stale.
+            if (cnxn.isStale() || cnxn.isInvalid()) {
+                return true;
+            }
+        }
+
+        if (staleLatencyCheck) {
+            // If the request latency is higher than session timeout, consider
+            // the request stale.
+            long currentTime = Time.currentElapsedTime();
+            return (currentTime - createTime) > cnxn.getSessionTimeout();
+        }
+
+        return false;
+    }
+
+    /**
+     * A prior request was dropped on this request's connection and
+     * therefore this request must also be dropped to ensure correct
+     * ordering semantics.
+     */
+    public boolean mustDrop() {
+        return ((cnxn != null) && cnxn.isInvalid());
     }
 
     /**
@@ -168,9 +267,12 @@ public class Request {
         case OpCode.setACL:
         case OpCode.setData:
         case OpCode.setWatches:
+        case OpCode.setWatches2:
         case OpCode.sync:
         case OpCode.checkWatches:
         case OpCode.removeWatches:
+        case OpCode.addWatch:
+        case OpCode.whoAmI:
             return true;
         default:
             return false;
@@ -187,6 +289,7 @@ public class Request {
         case OpCode.getData:
         case OpCode.getEphemerals:
         case OpCode.multiRead:
+        case OpCode.whoAmI:
             return false;
         case OpCode.create:
         case OpCode.create2:
@@ -209,66 +312,74 @@ public class Request {
         }
     }
 
-    static String op2String(int op) {
+    public static String op2String(int op) {
         switch (op) {
-        case OpCode.notification:
-            return "notification";
-        case OpCode.create:
-            return "create";
-        case OpCode.create2:
-            return "create2";
-        case OpCode.createTTL:
-            return "createTtl";
-        case OpCode.createContainer:
-            return "createContainer";
-        case OpCode.setWatches:
-            return "setWatches";
-        case OpCode.delete:
-            return "delete";
-        case OpCode.deleteContainer:
-            return "deleteContainer";
-        case OpCode.exists:
-            return "exists";
-        case OpCode.getData:
-            return "getData";
-        case OpCode.check:
-            return "check";
-        case OpCode.multi:
-            return "multi";
-        case OpCode.multiRead:
-            return "multiRead";
-        case OpCode.setData:
-            return "setData";
-        case OpCode.sync:
-              return "sync:";
-        case OpCode.getACL:
-            return "getACL";
-        case OpCode.setACL:
-            return "setACL";
-        case OpCode.getChildren:
-            return "getChildren";
-        case OpCode.getAllChildrenNumber:
-            return "getAllChildrenNumber";
-        case OpCode.getChildren2:
-            return "getChildren2";
-        case OpCode.getEphemerals:
-            return "getEphemerals";
-        case OpCode.ping:
-            return "ping";
-        case OpCode.createSession:
-            return "createSession";
-        case OpCode.closeSession:
-            return "closeSession";
-        case OpCode.error:
-            return "error";
-        case OpCode.reconfig:
-           return "reconfig";
-        case OpCode.checkWatches:
-            return "checkWatches";
-        case OpCode.removeWatches:
-            return "removeWatches";
-        default:
-            return "unknown " + op;
+            case OpCode.notification:
+                return "notification";
+            case OpCode.create:
+                return "create";
+            case OpCode.delete:
+                return "delete";
+            case OpCode.exists:
+                return "exists";
+            case OpCode.getData:
+                return "getData";
+            case OpCode.setData:
+                return "setData";
+            case OpCode.getACL:
+                return "getACL";
+            case OpCode.setACL:
+                return "setACL";
+            case OpCode.getChildren:
+                return "getChildren";
+            case OpCode.sync:
+                return "sync";
+            case OpCode.ping:
+                return "ping";
+            case OpCode.getChildren2:
+                return "getChildren2";
+            case OpCode.check:
+                return "check";
+            case OpCode.multi:
+                return "multi";
+            case OpCode.create2:
+                return "create2";
+            case OpCode.reconfig:
+                return "reconfig";
+            case OpCode.checkWatches:
+                return "checkWatches";
+            case OpCode.removeWatches:
+                return "removeWatches";
+            case OpCode.createContainer:
+                return "createContainer";
+            case OpCode.deleteContainer:
+                return "deleteContainer";
+            case OpCode.createTTL:
+                return "createTtl";
+            case OpCode.multiRead:
+                return "multiRead";
+            case OpCode.auth:
+                return "auth";
+            case OpCode.setWatches:
+                return "setWatches";
+            case OpCode.setWatches2:
+                return "setWatches2";
+            case OpCode.sasl:
+                return "sasl";
+            case OpCode.getEphemerals:
+                return "getEphemerals";
+            case OpCode.getAllChildrenNumber:
+                return "getAllChildrenNumber";
+            case OpCode.createSession:
+                return "createSession";
+            case OpCode.closeSession:
+                return "closeSession";
+            case OpCode.error:
+                return "error";
+            case OpCode.whoAmI:
+                return "whoAmI";
+            default:
+                return "unknown " + op;
         }
     }
 
@@ -276,34 +387,29 @@ public class Request {
     public String toString() {
         StringBuilder sb = new StringBuilder();
         sb.append("sessionid:0x").append(Long.toHexString(sessionId))
-            .append(" type:").append(op2String(type))
-            .append(" cxid:0x").append(Long.toHexString(cxid))
-            .append(" zxid:0x").append(Long.toHexString(hdr == null ?
-                    -2 : hdr.getZxid()))
-            .append(" txntype:").append(hdr == null ?
-                    "unknown" : "" + hdr.getType());
+          .append(" type:").append(op2String(type))
+          .append(" cxid:0x").append(Long.toHexString(cxid))
+          .append(" zxid:0x").append(Long.toHexString(hdr == null ? -2 : hdr.getZxid()))
+          .append(" txntype:").append(hdr == null ? "unknown" : "" + hdr.getType());
 
         // best effort to print the path assoc with this request
         String path = "n/a";
         if (type != OpCode.createSession
-                && type != OpCode.setWatches
-                && type != OpCode.closeSession
-                && request != null
-                && request.remaining() >= 4)
-        {
+            && type != OpCode.setWatches
+            && type != OpCode.setWatches2
+            && type != OpCode.closeSession
+            && request != null
+            && request.remaining() >= 4) {
             try {
                 // make sure we don't mess with request itself
                 ByteBuffer rbuf = request.asReadOnlyBuffer();
                 rbuf.clear();
                 int pathLen = rbuf.getInt();
                 // sanity check
-                if (pathLen >= 0
-                        && pathLen < 4096
-                        && rbuf.remaining() >= pathLen)
-                {
-                    byte b[] = new byte[pathLen];
+                if (pathLen >= 0 && pathLen < 4096 && rbuf.remaining() >= pathLen) {
+                    byte[] b = new byte[pathLen];
                     rbuf.get(b);
-                    path = new String(b);
+                    path = new String(b, UTF_8);
                 }
             } catch (Exception e) {
                 // ignore - can't find the path, will output "n/a" instead
@@ -326,14 +432,14 @@ public class Request {
         logLatency(metric, Time.currentWallTime());
     }
 
-    public void logLatency(Summary metric, long currentTime){
+    public void logLatency(Summary metric, long currentTime) {
         if (hdr != null) {
             /* Request header is created by leader. If there is clock drift
              * latency might be negative. Headers use wall time, not
              * CLOCK_MONOTONIC.
              */
             long latency = currentTime - hdr.getTime();
-            if (latency > 0) {
+            if (latency >= 0) {
                 metric.add(latency);
             }
         }
@@ -346,7 +452,7 @@ public class Request {
              * CLOCK_MONOTONIC.
              */
             long latency = currentTime - hdr.getTime();
-            if (latency > 0) {
+            if (latency >= 0) {
                 metric.add(key, latency);
             }
         }
@@ -354,5 +460,34 @@ public class Request {
 
     public void logLatency(SummarySet metric, String key) {
         logLatency(metric, key, Time.currentWallTime());
+    }
+
+    /**
+     * Returns a formatted, comma-separated list of the user IDs
+     * associated with this {@code Request}, or {@code null} if no
+     * user IDs were found.
+     *
+     * The return value is used for audit logging.  While it may be
+     * easy on the eyes, it is underspecified: it does not mention the
+     * corresponding {@code scheme}, nor are its components escaped.
+     * This is not a security feature.
+     *
+     * @return a comma-separated list of user IDs, or {@code null} if
+     * no user IDs were found.
+     */
+    public String getUsersForAudit() {
+        return AuthUtil.getUsers(authInfo);
+    }
+
+    public TxnDigest getTxnDigest() {
+        return txnDigest;
+    }
+
+    public void setTxnDigest(TxnDigest txnDigest) {
+        this.txnDigest = txnDigest;
+    }
+
+    public boolean isFromLearner() {
+        return owner instanceof LearnerHandler;
     }
 }

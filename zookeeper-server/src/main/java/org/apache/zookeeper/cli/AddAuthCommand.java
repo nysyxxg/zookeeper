@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -15,13 +15,14 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package org.apache.zookeeper.cli;
 
+import static java.nio.charset.StandardCharsets.UTF_8;
 import org.apache.commons.cli.CommandLine;
+import org.apache.commons.cli.DefaultParser;
 import org.apache.commons.cli.Options;
 import org.apache.commons.cli.ParseException;
-import org.apache.commons.cli.Parser;
-import org.apache.commons.cli.PosixParser;
 
 /**
  * addAuth command for cli
@@ -37,7 +38,7 @@ public class AddAuthCommand extends CliCommand {
 
     @Override
     public CliCommand parse(String[] cmdArgs) throws CliParseException {
-        Parser parser = new PosixParser();
+        DefaultParser parser = new DefaultParser();
         CommandLine cl;
         try {
             cl = parser.parse(options, cmdArgs);
@@ -57,11 +58,12 @@ public class AddAuthCommand extends CliCommand {
     public boolean exec() throws CliException {
         byte[] b = null;
         if (args.length >= 3) {
-            b = args[2].getBytes();
+            b = args[2].getBytes(UTF_8);
         }
 
         zk.addAuthInfo(args[1], b);
 
         return false;
     }
+
 }

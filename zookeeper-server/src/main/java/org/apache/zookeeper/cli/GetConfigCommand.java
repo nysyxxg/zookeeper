@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -15,9 +15,14 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package org.apache.zookeeper.cli;
 
-import org.apache.commons.cli.*;
+import static java.nio.charset.StandardCharsets.UTF_8;
+import org.apache.commons.cli.CommandLine;
+import org.apache.commons.cli.DefaultParser;
+import org.apache.commons.cli.Options;
+import org.apache.commons.cli.ParseException;
 import org.apache.zookeeper.KeeperException;
 import org.apache.zookeeper.data.Stat;
 import org.apache.zookeeper.server.util.ConfigUtils;
@@ -28,7 +33,7 @@ import org.apache.zookeeper.server.util.ConfigUtils;
 public class GetConfigCommand extends CliCommand {
 
     private static Options options = new Options();
-    private String args[];
+    private String[] args;
     private CommandLine cl;
 
     static {
@@ -44,7 +49,7 @@ public class GetConfigCommand extends CliCommand {
     @Override
     public CliCommand parse(String[] cmdArgs) throws CliParseException {
 
-        Parser parser = new PosixParser();
+        DefaultParser parser = new DefaultParser();
         try {
             cl = parser.parse(options, cmdArgs);
         } catch (ParseException ex) {
@@ -60,25 +65,26 @@ public class GetConfigCommand extends CliCommand {
 
     @Override
     public boolean exec() throws CliException {
-        boolean watch = cl.hasOption("w");        
+        boolean watch = cl.hasOption("w");
         Stat stat = new Stat();
-        byte data[];
+        byte[] data;
         try {
             data = zk.getConfig(watch, stat);
-        } catch (KeeperException|InterruptedException ex) {
+        } catch (KeeperException | InterruptedException ex) {
             throw new CliWrapperException(ex);
         }
-        data = (data == null) ? "null".getBytes() : data;
+        data = (data == null) ? "null".getBytes(UTF_8) : data;
         if (cl.hasOption("c")) {
-            out.println(ConfigUtils.getClientConfigStr(new String(data)));
+            out.println(ConfigUtils.getClientConfigStr(new String(data, UTF_8)));
         } else {
-            out.println(new String(data));
+            out.println(new String(data, UTF_8));
         }
-        
+
         if (cl.hasOption("s")) {
             new StatPrinter(out).print(stat);
-        }                
-        
+        }
+
         return watch;
     }
+
 }

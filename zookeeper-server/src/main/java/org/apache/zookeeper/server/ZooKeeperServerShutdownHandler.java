@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -15,10 +15,10 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+
 package org.apache.zookeeper.server;
 
 import java.util.concurrent.CountDownLatch;
-
 import org.apache.zookeeper.server.ZooKeeperServer.State;
 
 /**
@@ -26,8 +26,9 @@ import org.apache.zookeeper.server.ZooKeeperServer.State;
  * SHUTDOWN server state transitions, which in turn releases the associated
  * shutdown latch.
  */
-class ZooKeeperServerShutdownHandler {
-    private final CountDownLatch shutdownLatch;
+public final class ZooKeeperServerShutdownHandler {
+
+        private final CountDownLatch shutdownLatch;
 
     ZooKeeperServerShutdownHandler(CountDownLatch shutdownLatch) {
         this.shutdownLatch = shutdownLatch;
@@ -38,9 +39,10 @@ class ZooKeeperServerShutdownHandler {
      *
      * @param state new server state
      */
-    void handle(State state) {
+    public void handle(State state) {
         if (state == State.ERROR || state == State.SHUTDOWN) {
             shutdownLatch.countDown();
         }
     }
+
 }

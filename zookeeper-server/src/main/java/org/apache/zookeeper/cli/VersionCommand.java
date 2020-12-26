@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements. See the NOTICE file distributed with this
  * work for additional information regarding copyright ownership. The ASF
@@ -14,13 +14,13 @@
  * License for the specific language governing permissions and limitations under
  * the License.
  */
+
 package org.apache.zookeeper.cli;
 
 import org.apache.commons.cli.CommandLine;
+import org.apache.commons.cli.DefaultParser;
 import org.apache.commons.cli.Options;
 import org.apache.commons.cli.ParseException;
-import org.apache.commons.cli.Parser;
-import org.apache.commons.cli.PosixParser;
 import org.apache.zookeeper.Version;
 
 /**
@@ -37,7 +37,7 @@ public class VersionCommand extends CliCommand {
 
     @Override
     public CliCommand parse(String[] cmdArgs) throws CliParseException {
-        Parser parser = new PosixParser();
+        DefaultParser parser = new DefaultParser();
         CommandLine cl;
         try {
             cl = parser.parse(options, cmdArgs);
@@ -58,4 +58,5 @@ public class VersionCommand extends CliCommand {
 
         return false;
     }
+
 }

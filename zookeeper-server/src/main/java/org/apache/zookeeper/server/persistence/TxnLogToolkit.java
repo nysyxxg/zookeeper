@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -18,28 +18,7 @@
 
 package org.apache.zookeeper.server.persistence;
 
-import org.apache.commons.cli.CommandLine;
-import org.apache.commons.cli.CommandLineParser;
-import org.apache.commons.cli.HelpFormatter;
-import org.apache.commons.cli.Option;
-import org.apache.commons.cli.Options;
-import org.apache.commons.cli.ParseException;
-import org.apache.commons.cli.PosixParser;
-import org.apache.jute.BinaryInputArchive;
-import org.apache.jute.BinaryOutputArchive;
-import org.apache.jute.Record;
-import org.apache.zookeeper.server.ExitCode;
-import org.apache.zookeeper.server.TraceFormatter;
-import org.apache.zookeeper.server.util.LogChopper;
-import org.apache.zookeeper.server.util.SerializeUtils;
-import org.apache.zookeeper.txn.CreateContainerTxn;
-import org.apache.zookeeper.txn.CreateTTLTxn;
-import org.apache.zookeeper.txn.CreateTxn;
-import org.apache.zookeeper.txn.MultiTxn;
-import org.apache.zookeeper.txn.SetDataTxn;
-import org.apache.zookeeper.txn.Txn;
-import org.apache.zookeeper.txn.TxnHeader;
-
+import static org.apache.zookeeper.server.persistence.FileTxnLog.TXNLOG_MAGIC;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.Closeable;
@@ -51,18 +30,41 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 import java.text.DateFormat;
 import java.util.Date;
 import java.util.List;
 import java.util.Scanner;
 import java.util.zip.Adler32;
 import java.util.zip.Checksum;
-
-import static org.apache.zookeeper.server.persistence.FileTxnLog.TXNLOG_MAGIC;
+import org.apache.commons.cli.CommandLine;
+import org.apache.commons.cli.CommandLineParser;
+import org.apache.commons.cli.DefaultParser;
+import org.apache.commons.cli.HelpFormatter;
+import org.apache.commons.cli.Option;
+import org.apache.commons.cli.Options;
+import org.apache.commons.cli.ParseException;
+import org.apache.jute.BinaryInputArchive;
+import org.apache.jute.BinaryOutputArchive;
+import org.apache.jute.Record;
+import org.apache.zookeeper.server.ExitCode;
+import org.apache.zookeeper.server.Request;
+import org.apache.zookeeper.server.TxnLogEntry;
+import org.apache.zookeeper.server.util.LogChopper;
+import org.apache.zookeeper.server.util.SerializeUtils;
+import org.apache.zookeeper.txn.CreateContainerTxn;
+import org.apache.zookeeper.txn.CreateTTLTxn;
+import org.apache.zookeeper.txn.CreateTxn;
+import org.apache.zookeeper.txn.MultiTxn;
+import org.apache.zookeeper.txn.SetDataTxn;
+import org.apache.zookeeper.txn.Txn;
+import org.apache.zookeeper.txn.TxnHeader;
+import org.apache.zookeeper.util.ServiceUtils;
 
 public class TxnLogToolkit implements Closeable {
 
     static class TxnLogToolkitException extends Exception {
+
         private static final long serialVersionUID = 1L;
         private int exitCode;
 
@@ -74,9 +76,11 @@ public class TxnLogToolkit implements Closeable {
         int getExitCode() {
             return exitCode;
         }
+
     }
 
     static class TxnLogToolkitParseException extends TxnLogToolkitException {
+
         private static final long serialVersionUID = 1L;
         private Options options;
 
@@ -88,6 +92,7 @@ public class TxnLogToolkit implements Closeable {
         Options getOptions() {
             return options;
         }
+
     }
 
     private File txnLogFile;
@@ -123,12 +128,15 @@ public class TxnLogToolkit implements Closeable {
             printHelpAndExit(e.getExitCode(), e.getOptions());
         } catch (TxnLogToolkitException e) {
             System.err.println(e.getMessage());
-            System.exit(e.getExitCode());
+            ServiceUtils.requestSystemExit(e.getExitCode());
         }
     }
 
-    public TxnLogToolkit(boolean recoveryMode, boolean verbose, String txnLogFileName, boolean force)
-            throws FileNotFoundException, TxnLogToolkitException {
+    public TxnLogToolkit(
+        boolean recoveryMode,
+        boolean verbose,
+        String txnLogFileName,
+        boolean force) throws FileNotFoundException, TxnLogToolkitException {
         this.recoveryMode = recoveryMode;
         this.verbose = verbose;
         this.force = force;
@@ -136,7 +144,10 @@ public class TxnLogToolkit implements Closeable {
         if (recoveryMode) {
             recoveryLogFile = new File(txnLogFile.toString() + ".fixed");
             if (recoveryLogFile.exists()) {
-                throw new TxnLogToolkitException(ExitCode.UNEXPECTED_ERROR.getValue(), "Recovery file %s already exists or not writable", recoveryLogFile);
+                throw new TxnLogToolkitException(
+                    ExitCode.UNEXPECTED_ERROR.getValue(),
+                    "Recovery file %s already exists or not writable",
+                    recoveryLogFile);
             }
         }
 
@@ -154,7 +165,10 @@ public class TxnLogToolkit implements Closeable {
     private File loadTxnFile(String txnLogFileName) throws TxnLogToolkitException {
         File logFile = new File(txnLogFileName);
         if (!logFile.exists() || !logFile.canRead()) {
-            throw new TxnLogToolkitException(ExitCode.UNEXPECTED_ERROR.getValue(), "File doesn't exist or not readable: %s", logFile);
+            throw new TxnLogToolkitException(
+                ExitCode.UNEXPECTED_ERROR.getValue(),
+                "File doesn't exist or not readable: %s",
+                logFile);
         }
         return logFile;
     }
@@ -165,11 +179,13 @@ public class TxnLogToolkit implements Closeable {
         FileHeader fhdr = new FileHeader();
         fhdr.deserialize(logStream, "fileheader");
         if (fhdr.getMagic() != TXNLOG_MAGIC) {
-            throw new TxnLogToolkitException(ExitCode.INVALID_INVOCATION.getValue(), "Invalid magic number for %s", txnLogFile.getName());
+            throw new TxnLogToolkitException(
+                ExitCode.INVALID_INVOCATION.getValue(),
+                "Invalid magic number for %s",
+                txnLogFile.getName());
         }
-        System.out.println("ZooKeeper Transactional Log File with dbid "
-                + fhdr.getDbid() + " txnlog format version "
-                + fhdr.getVersion());
+        System.out.println("ZooKeeper Transactional Log File with dbid " + fhdr.getDbid()
+                           + " txnlog format version " + fhdr.getVersion());
 
         if (recoveryMode) {
             fhdr.serialize(recoveryOa, "fileheader");
@@ -223,7 +239,7 @@ public class TxnLogToolkit implements Closeable {
                 filePadding.padFile(recoveryFos.getChannel());
                 recoveryOa.writeLong(crcValue, "crcvalue");
                 recoveryOa.writeBuffer(bytes, "txnEntry");
-                recoveryOa.writeByte((byte)'B', "EOR");
+                recoveryOa.writeByte((byte) 'B', "EOR");
             }
             count++;
         }
@@ -231,12 +247,13 @@ public class TxnLogToolkit implements Closeable {
 
     public void chop() {
         File targetFile = new File(txnLogFile.getParentFile(), txnLogFile.getName() + ".chopped" + zxid);
-        try (
-                InputStream is = new BufferedInputStream(new FileInputStream(txnLogFile));
-                OutputStream os = new BufferedOutputStream(new FileOutputStream(targetFile))
-        ) {
+        try (InputStream is = new BufferedInputStream(new FileInputStream(txnLogFile));
+             OutputStream os = new BufferedOutputStream(new FileOutputStream(targetFile))) {
             if (!LogChopper.chop(is, os, zxid)) {
-                throw new TxnLogToolkitException(ExitCode.INVALID_INVOCATION.getValue(), "Failed to chop %s", txnLogFile.getName());
+                throw new TxnLogToolkitException(
+                    ExitCode.INVALID_INVOCATION.getValue(),
+                    "Failed to chop %s",
+                    txnLogFile.getName());
             }
         } catch (Exception e) {
             System.out.println("Got exception: " + e.getMessage());
@@ -252,12 +269,12 @@ public class TxnLogToolkit implements Closeable {
             System.out.print("Would you like to fix it (Yes/No/Abort) ? ");
             char answer = Character.toUpperCase(scanner.next().charAt(0));
             switch (answer) {
-                case 'Y':
-                    return true;
-                case 'N':
-                    return false;
-                case 'A':
-                    throw new TxnLogToolkitException(ExitCode.EXECUTION_FINISHED.getValue(), "Recovery aborted.");
+            case 'Y':
+                return true;
+            case 'N':
+                return false;
+            case 'A':
+                throw new TxnLogToolkitException(ExitCode.EXECUTION_FINISHED.getValue(), "Recovery aborted.");
             }
         }
     }
@@ -267,16 +284,18 @@ public class TxnLogToolkit implements Closeable {
     }
 
     private void printTxn(byte[] bytes, String prefix) throws IOException {
-        TxnHeader hdr = new TxnHeader();
-        Record txn = SerializeUtils.deserializeTxn(bytes, hdr);
-        String txnStr = getDataStrFromTxn(txn);
-        String txns = String.format("%s session 0x%s cxid 0x%s zxid 0x%s %s %s",
-                DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.LONG).format(new Date(hdr.getTime())),
-                Long.toHexString(hdr.getClientId()),
-                Long.toHexString(hdr.getCxid()),
-                Long.toHexString(hdr.getZxid()),
-                TraceFormatter.op2String(hdr.getType()),
-                txnStr);
+        TxnLogEntry logEntry = SerializeUtils.deserializeTxn(bytes);
+        TxnHeader hdr = logEntry.getHeader();
+        Record txn = logEntry.getTxn();
+        String txnStr = getFormattedTxnStr(txn);
+        String txns = String.format(
+            "%s session 0x%s cxid 0x%s zxid 0x%s %s %s",
+            DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.LONG).format(new Date(hdr.getTime())),
+            Long.toHexString(hdr.getClientId()),
+            Long.toHexString(hdr.getCxid()),
+            Long.toHexString(hdr.getZxid()),
+                Request.op2String(hdr.getType()),
+            txnStr);
         if (prefix != null && !"".equals(prefix.trim())) {
             System.out.print(prefix + " - ");
         }
@@ -288,42 +307,42 @@ public class TxnLogToolkit implements Closeable {
     }
 
     /**
-     * get transaction log data string with node's data as a string
-     * @param txn
-     * @return
+     * get the formatted string from the txn.
+     * @param txn transaction log data
+     * @return the formatted string
      */
-    private static String getDataStrFromTxn(Record txn) {
+    private static String getFormattedTxnStr(Record txn) throws IOException {
         StringBuilder txnData = new StringBuilder();
         if (txn == null) {
             return txnData.toString();
         }
         if (txn instanceof CreateTxn) {
             CreateTxn createTxn = ((CreateTxn) txn);
-            txnData.append(createTxn.getPath() + "," + new String(createTxn.getData()))
+            txnData.append(createTxn.getPath() + "," + checkNullToEmpty(createTxn.getData()))
                    .append("," + createTxn.getAcl() + "," + createTxn.getEphemeral())
                    .append("," + createTxn.getParentCVersion());
         } else if (txn instanceof SetDataTxn) {
             SetDataTxn setDataTxn = ((SetDataTxn) txn);
-            txnData.append(setDataTxn.getPath() + "," + new String(setDataTxn.getData()))
+            txnData.append(setDataTxn.getPath() + "," + checkNullToEmpty(setDataTxn.getData()))
                    .append("," + setDataTxn.getVersion());
         } else if (txn instanceof CreateContainerTxn) {
             CreateContainerTxn createContainerTxn = ((CreateContainerTxn) txn);
-            txnData.append(createContainerTxn.getPath() + "," + new String(createContainerTxn.getData()))
+            txnData.append(createContainerTxn.getPath() + "," + checkNullToEmpty(createContainerTxn.getData()))
                    .append("," + createContainerTxn.getAcl() + "," + createContainerTxn.getParentCVersion());
         } else if (txn instanceof CreateTTLTxn) {
             CreateTTLTxn createTTLTxn = ((CreateTTLTxn) txn);
-            txnData.append(createTTLTxn.getPath() + "," + new String(createTTLTxn.getData()))
+            txnData.append(createTTLTxn.getPath() + "," + checkNullToEmpty(createTTLTxn.getData()))
                    .append("," + createTTLTxn.getAcl() + "," + createTTLTxn.getParentCVersion())
                    .append("," + createTTLTxn.getTtl());
         } else if (txn instanceof MultiTxn) {
             MultiTxn multiTxn = ((MultiTxn) txn);
             List<Txn> txnList = multiTxn.getTxns();
-            for (int i = 0; i < txnList.size(); i++ ) {
+            for (int i = 0; i < txnList.size(); i++) {
                 Txn t = txnList.get(i);
                 if (i == 0) {
-                    txnData.append(TraceFormatter.op2String(t.getType()) + ":" + new String(t.getData()));
+                    txnData.append(Request.op2String(t.getType()) + ":" + checkNullToEmpty(t.getData()));
                 } else {
-                    txnData.append(";" + TraceFormatter.op2String(t.getType()) + ":" + new String(t.getData()));
+                    txnData.append(";" + Request.op2String(t.getType()) + ":" + checkNullToEmpty(t.getData()));
                 }
             }
         } else {
@@ -332,7 +351,15 @@ public class TxnLogToolkit implements Closeable {
 
         return txnData.toString();
     }
-    
+
+    private static String checkNullToEmpty(byte[] data) throws IOException {
+        if (data == null || data.length == 0) {
+            return "";
+        }
+
+        return new String(data, StandardCharsets.UTF_8);
+    }
+
     private void openTxnLogFile() throws FileNotFoundException {
         txnFis = new FileInputStream(txnLogFile);
         logStream = BinaryInputArchive.getArchive(txnFis);
@@ -356,7 +383,7 @@ public class TxnLogToolkit implements Closeable {
     }
 
     private static TxnLogToolkit parseCommandLine(String[] args) throws TxnLogToolkitException, FileNotFoundException {
-        CommandLineParser parser = new PosixParser();
+        CommandLineParser parser = new DefaultParser();
         Options options = new Options();
 
         Option helpOpt = new Option("h", "help", false, "Print help message");
@@ -399,8 +426,8 @@ public class TxnLogToolkit implements Closeable {
 
     private static void printHelpAndExit(int exitCode, Options options) {
         HelpFormatter help = new HelpFormatter();
-        help.printHelp(120,"TxnLogToolkit [-dhrvc] <txn_log_file_name> (-z <zxid>)", "", options, "");
-        System.exit(exitCode);
+        help.printHelp(120, "TxnLogToolkit [-dhrvc] <txn_log_file_name> (-z <zxid>)", "", options, "");
+        ServiceUtils.requestSystemExit(exitCode);
     }
 
     private void printStat() {
@@ -416,4 +443,5 @@ public class TxnLogToolkit implements Closeable {
         }
         closeTxnLogFile();
     }
+
 }
