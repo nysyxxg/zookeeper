@@ -22,6 +22,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 
+//StringUtil: 分割和拼接字符串，默认是分割成String[]，这里改进为列表
 public class StringUtils {
 
     private StringUtils() {/** non instantiable and non inheritable **/}

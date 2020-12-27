@@ -60,6 +60,9 @@ import org.slf4j.LoggerFactory;
  *
  *   Performance testing done by Facebook engineers shows that on Intel x86_64 machines, Java9 performs better with
  *   GCM and Java8 performs better with CBC, so these seem like reasonable defaults.
+ *   X509Util和ZKConfig大多属性标记废弃了,X.509是一种非常通用的证书格式。
+ *   所有的证书都符合ITU-T X.509国际标准，因此(理论上)为一种应用创建的证书可以用于任何其他符合X.509标准的应用。
+ *
  */
 public abstract class X509Util implements Closeable, AutoCloseable {
 

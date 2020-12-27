@@ -43,6 +43,7 @@ import org.slf4j.LoggerFactory;
  * file - instead the target file is deleted before this one is moved into
  * place.
  */
+// AtomicFileOutputStream: 但是没有看出哪里原子了…这个类是从HDFS直接弄过来的
 public class AtomicFileOutputStream extends FilterOutputStream {
 
     private static final String TMP_EXTENSION = ".tmp";

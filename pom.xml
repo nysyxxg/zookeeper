@@ -986,7 +986,7 @@
             <exclude>**/tests/wrappers-mt.opt</exclude>
             <exclude>**/c-doc.Doxyfile</exclude>
           </excludes>
-          <consoleOutput>true</consoleOutput>
+          <!--<consoleOutput>true</consoleOutput>-->
         </configuration>
       </plugin>
       <plugin>

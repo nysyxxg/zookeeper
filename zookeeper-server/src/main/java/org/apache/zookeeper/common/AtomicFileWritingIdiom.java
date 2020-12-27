@@ -31,6 +31,10 @@ import java.io.Writer;
  *  the original file (if it exists) is left intact.
  *  Based on the org.apache.zookeeper.server.quorum.QuorumPeer.writeLongToFile(...) idiom
  *  using the HDFS AtomicFileOutputStream class.
+ *
+ *  AtomicFileWritingIdiom：为了提供文件的原子写入，
+ *  Based on the org.apache.zookeeper.server.quorum.QuorumPeer.writeLongToFile(…) idiom ，
+ *  using the HDFS AtomicFileOutputStream class.
  */
 public class AtomicFileWritingIdiom {
 
